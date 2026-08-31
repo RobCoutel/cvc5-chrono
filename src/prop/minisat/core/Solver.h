@@ -24,13 +24,16 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define Minisat_Solver_h
 
 #include <iosfwd>
+#include <vector>
 
 #include "base/check.h"
 #include "base/output.h"
 #include "context/context.h"
 #include "cvc5_private.h"
+#include "options/booleans_options.h"
 #include "proof/clause_id.h"
 #include "proof/proof_node_manager.h"
+#include "prop/minisat/core/SentinelWrapper.h"
 #include "prop/minisat/core/SolverTypes.h"
 #include "prop/minisat/mtl/Alg.h"
 #include "prop/minisat/mtl/Heap.h"
@@ -74,6 +77,47 @@ class Solver : protected EnvObj
   typedef vec<Lit> TLitVec;
 
  protected:
+#ifdef CVC5_USE_SATSENTINEL
+  /**
+   * The SATSentinel monitoring this solver and the clause bookkeeping that goes with it. Disabled,
+   * i.e. holding no sentinel, unless createSentinel() turned it on.
+   */
+  sentinel::wrapper::SentinelState d_sentinelState;
+
+  /**
+   * The sentinel to notify together with its clause bookkeeping. Read by the NOTIFY macro, which
+   * needs it by const reference: the notifications happen from const methods as well, and the
+   * state absorbs that by keeping the bookkeeping mutable.
+   */
+  const sentinel::wrapper::SentinelState& sentinelState() const
+  {
+    return d_sentinelState;
+  }
+
+  /** The sentinel to notify, or nullptr if monitoring is disabled. */
+  sentinel::SATSentinel* sentinelPtr() const
+  {
+    return d_sentinelState.sentinelPtr();
+  }
+
+  /**
+   * Turns d_sentinelState on if --sat-sentinel was passed, giving it the callbacks
+   * that render a variable and a clause the way cvc5 sees them. Must be called at the very
+   * beginning of the constructor: notifications emitted before this point would be lost, and the
+   * sentinel needs to see the whole history of the solver in order to mirror its state.
+   */
+  void createSentinel();
+#endif
+
+  /**
+   * Whether the literal on top of the trail is the decision literal of the current level.
+   *
+   * Note that the NOTIFY call sites pass the solver's own clause references; turning one into the
+   * identifier the sentinel knows it by is SentinelState::convert()'s job, and happens inside the
+   * notification.
+   */
+  bool sentinelIsDecision() const;
+
   /** The pointer to the proxy that provides interfaces to the SMT engine */
   cvc5::internal::prop::TheoryProxy* d_proxy;
 
@@ -88,6 +132,22 @@ class Solver : protected EnvObj
 
   /** Variable representing false */
   Var varFalse;
+
+  /**
+   * A variable permanently asserted false at level 0, dedicated *solely* to
+   * padding a genuinely-unit fact into a real, >=2-literal MiniSat clause
+   * (reason()'s on-demand explanation, reimplyLit()'s elevate branch, and
+   * updateLemmas()'s eager unit-lemma attach all use it this way) -- never
+   * exposed to CnfStream for any genuine CNF/theory content. Deliberately
+   * separate from varTrue/varFalse: those two *are* shared with genuine CNF
+   * encodings of the actual Boolean constants (CnfStream::newLiteral() maps
+   * true/false onto them), so a clause mentioning one of them is not
+   * necessarily padding -- see the "varTrue/varFalse ambiguity" discussion.
+   * Because varPad is never used for anything else, SatProofManager::
+   * getClauseNode() can safely and generically drop it from a clause's proof
+   * Node by content alone, with no per-clause provenance tracking needed.
+   */
+  Var varPad;
 
   /** The resolution proof manager */
   std::unique_ptr<cvc5::internal::prop::SatProofManager> d_pfManager;
@@ -136,6 +196,10 @@ class Solver : protected EnvObj
                                           // specifying variable mode.
   Var trueVar() const { return varTrue; }
   Var falseVar() const { return varFalse; }
+  /** See the doc comment on the varPad member. */
+  Var padVar() const { return varPad; }
+
+  int computeClauseLevel(CRef cref) const;
 
   /**
    * Initializes the SAT proof manager.
@@ -186,9 +250,18 @@ class Solver : protected EnvObj
       // Unassigned literals are put to front
       if (x_value == l_Undef) return true;
       if (y_value == l_Undef) return false;
-      // Literals of the same value are sorted by decreasing levels
+      // Literals of the same value are sorted by decreasing levels. Under chronological
+      // backtracking, trail position no longer tracks level, so level() has to be compared
+      // directly rather than using trail_index() as a proxy for it; trail_index() only breaks
+      // ties between literals at the same level.
       if (x_value == y_value)
       {
+        int x_level = d_solver.level(var(x));
+        int y_level = d_solver.level(var(y));
+        if (x_level != y_level)
+        {
+          return x_level > y_level;
+        }
         return d_solver.trail_index(var(x)) > d_solver.trail_index(var(y));
       }
       else
@@ -449,6 +522,17 @@ class Solver : protected EnvObj
       trail_lim;  // Separator indices for different decision levels in 'trail'.
   vec<bool> trail_ok;    // Stack of "whether we're in conflict" flags.
   vec<VarData> vardata;  // Stores reason and level for each variable.
+  /**
+   * The lazy strong chronological backtracking (LSCB) reimplication vector,
+   * called lambda in [Coutelier, Fleury, Kovacs; SAT 2024]. d_lazyReason[x],
+   * when not CRef_Undef, names a clause that is a missed lower implication
+   * (MLI) for x: x is currently satisfied at a higher level than the clause
+   * justifies. It is recorded, not acted upon, when detected; cancelUntil()
+   * reimplies x at the clause's true (lower) level once backtracking
+   * unassigns it. Parallel to vardata, grown/shrunk alongside it. Only
+   * populated when chronologicalBacktracking is on and elevate is off.
+   */
+  vec<CRef> d_lazyReason;
   int qhead;  // Head of queue (as index into the trail -- no more explicit
               // propagation queue in MiniSat).
   int simpDB_assigns;    // Number of top-level assignments since last execution
@@ -511,7 +595,7 @@ class Solver : protected EnvObj
   Lit pickBranchLit();      // Return the next decision variable.
   void newDecisionLevel();  // Begins a new decision level.
   void uncheckedEnqueue(
-      Lit p, CRef from = CRef_Undef);  // Enqueue a literal. Assumes value of
+      Lit p, CRef from = CRef_Undef, int level=0);  // Enqueue a literal. Assumes value of
                                        // literal is undefined.
   bool enqueue(Lit p,
                CRef from = CRef_Undef);  // Test if fact 'p' contradicts current
@@ -525,7 +609,7 @@ class Solver : protected EnvObj
   void theoryCheck(
       cvc5::internal::theory::Theory::Effort
           effort);      // Perform a theory satisfiability check. Adds lemmas.
-  CRef updateLemmas();  // Add the lemmas, backtraking if necessary and return a
+  CRef updateLemmas();  // Add the lemmas, backtracking if necessary and return a
                         // conflict if there is one
   void cancelUntil(int level);  // Backtrack until a certain level.
   int analyze(CRef confl,
@@ -538,6 +622,19 @@ class Solver : protected EnvObj
   bool litRedundant(
       Lit p, uint32_t abstract_levels);  // (helper method for 'analyze()') -
                                          // true if p is redundant
+  /**
+   * Repairs a single conflict, whatever its origin (BCP, via search(), or a theory lemma, via
+   * updateLemmas()): analyzes it, backtracks, learns and attaches the resulting clause, and
+   * enqueues its asserting literal -- looping internally (exactly as search()'s old inline while
+   * loop did) if the learnt clause is itself still conflicting at the new, lower level. Never
+   * returns with an unresolved conflict.
+   *
+   * Returns false iff repairing this conflict concluded the formula is UNSAT -- 'ok' is set to
+   * false and, if needed, the proof is finalized; the caller should stop and propagate that up
+   * (mirrors the 'return ok = false;' convention used elsewhere in this file, e.g. simplify()).
+   * Returns true once the conflict is fully resolved.
+   */
+  bool repairConflict(CRef confl);
   lbool search(int nof_conflicts);  // Search for a given number of conflicts.
   lbool solve_();   // Main solve method (assumptions given in 'assumptions').
   void reduceDB();  // Reduce the set of learnt clauses.
@@ -560,9 +657,43 @@ class Solver : protected EnvObj
   void claBumpActivity(
       Clause& c);  // Increase a clause with the current 'bump' value.
 
+  /**
+   * Returns the utility of a literal. In the context of the clause attachment, this is used to determine which literal should be watched. The utility is based on the level of the literal and its position in the trail.
+   * A higher utility means the literal is more likely to be a good candidate for watching, as it may lead to earlier propagation or conflict detection.
+   */
+  int literalUtility(Lit lit);
+
   // Operations on clauses:
   //
-  void attachClause(CRef cr);  // Attach a clause to watcher lists.
+  /**
+   * Attaches a clause to the watcher lists. reattach must be true iff cr was already attached
+   * once and is being reattached under the same identifier without having gone through
+   * removeClause()/deleteClause() in between -- currently only SimpSolver::strengthenClause()'s
+   * detach-shrink-reattach sequence does this. Checked against the sentinel's own bookkeeping
+   * (under --sat-sentinel) rather than trusted blindly, since a mismatch would mean some other
+   * CRef-reuse bug is corrupting it.
+   */
+  void attachClause(CRef cr, bool reattach = false);
+  /**
+   * Checks whether cr's satisfied watched literal is a missed lower
+   * implication (MLI): satisfied at a level higher than the rest of the
+   * clause justifies. If so, handles it per the active CB strategy --
+   * elevate fixes the level in place (or re-watches a later literal in the
+   * trail instead, when that avoids touching levels at all), lazy strong
+   * chronological backtracking (LSCB, the default when
+   * chronologicalBacktracking is on) just records it in d_lazyReason for
+   * cancelUntil() to act on later. Called from attachClause(). See
+   * mli-notes.md.
+   */
+  void reimplyLit(Lit lit, CRef cr);
+  /**
+   * The decision level clause cr would imply for excluded if excluded were
+   * its only non-falsified literal, i.e. max level over cr's other literals
+   * (all of which must be falsified). Used to size a missed lower
+   * implication, both when first detected and when later reimplied.
+   */
+  int lazyImplicationLevel(CRef cr) const;
+
   void detachClause(CRef cr,
                     bool strict = false);  // Detach a clause to watcher lists.
   void removeClause(CRef cr);              // Detach and free a clause.
@@ -616,6 +747,8 @@ class Solver : protected EnvObj
   {
     return (int)(drand(seed) * size);
   }
+
+  void print_trail();
 };
 
 //=================================================================================================
@@ -699,6 +832,23 @@ inline void Solver::claBumpActivity(Clause& c)
     for (int i = 0; i < clauses_removable.size(); i++)
       ca[clauses_removable[i]].activity() *= 1e-20;
     cla_inc *= 1e-20;
+  }
+}
+
+inline int Solver::literalUtility(Lit lit)
+{
+  // satisfied literals alway go first
+  // then unassigned literals
+  // then falsified literals ordered by decreasing level (and trail index to break ties)
+  if (value(lit) == l_True) {
+    return 0x7FFFFFFF;
+  } else if (value(lit) == l_Undef) {
+    return 0x7FFFFFFE;
+  }
+  if (options().booleans.elevate) {
+    return trail_index(var(lit));
+  } else {
+    return level(var(lit));
   }
 }
 

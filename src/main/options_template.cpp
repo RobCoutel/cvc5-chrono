@@ -35,6 +35,7 @@ extern int optreset;
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <sstream>
 
 #include "base/check.h"
 #include "base/output.h"
@@ -272,6 +273,40 @@ void parseInternal(cvc5::Solver& solver,
 
     std::string option = argv[old_optind == 0 ? 1 : old_optind];
     std::string optionarg = (optarg == nullptr) ? "" : optarg;
+
+    // An option whose argument is the literal token "{" opens a brace group: every subsequent
+    // argv element, up to and including the matching "}", is consumed here (bypassing getopt_long
+    // entirely, so that elements looking like options of their own, e.g. "--gui", are not
+    // mistaken for options of cvc5) and joined with spaces into a single argument. This lets an
+    // option pass a whole sequence of tokens through to something else's own argument parser, e.g.
+    // `--sat-sentinel { --gui }`.
+    if (optionarg == "{")
+    {
+      std::ostringstream grouped;
+      bool foundClose = false;
+      while (main_optind < argc)
+      {
+        std::string tok = argv[main_optind];
+        ++main_optind;
+        if (tok == "}")
+        {
+          foundClose = true;
+          break;
+        }
+        if (grouped.tellp() > 0)
+        {
+          grouped << ' ';
+        }
+        grouped << tok;
+      }
+      if (!foundClose)
+      {
+        throw OptionException(std::string("option `") + option
+                              + "' expects a closing `}' to end its `{ ... }' group");
+      }
+      optionarg = grouped.str();
+      optind = main_optind;
+    }
 
     Trace("preemptGetopt") << "processing option " << c << " (`" << char(c)
                            << "'), " << option << std::endl;

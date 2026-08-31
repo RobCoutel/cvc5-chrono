@@ -23,6 +23,8 @@
 #include "prop/minisat/simp/SimpSolver.h"
 #include "util/statistics_stats.h"
 
+#include <iostream>
+
 namespace cvc5::internal {
 namespace prop {
 

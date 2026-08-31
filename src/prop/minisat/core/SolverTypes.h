@@ -300,6 +300,11 @@ class Clause
   // 'calcAbstraction' afterwards for
   //       subsumption operations to behave correctly.
   Lit& operator[](int i) { return data[i].lit; }
+  // Returns by value, not by const reference: `c[i] = x` on a `const Clause&`
+  // compiles (it assigns into a throwaway temporary via Lit's implicit
+  // operator=) but silently does nothing to the actual clause. This
+  // overload does not protect callers from mutating-through-const the way a
+  // `const Lit&` return would.
   Lit operator[](int i) const { return data[i].lit; }
   operator const Lit*(void) const { return (Lit*)data; }
 
@@ -323,6 +328,13 @@ class Clause
 
 const CRef CRef_Undef = RegionAllocator<uint32_t>::Ref_Undef;
 const CRef CRef_Lazy = RegionAllocator<uint32_t>::Ref_Undef - 1;
+// LSCB/elevate: d_lazyReason[x] == CRef_LazyRoot records that x is a missed lower implication
+// reimpliable at level 0, without naming which clause showed that (irrelevant -- level 0 needs
+// no witness level, and the clause need not survive until the reimplication happens). Never
+// used as a real vardata[x].d_reason; cancelUntil() reimplies with CRef_Lazy instead, so a real
+// explanation is (re)derived from the theory if reason() is ever asked for one. See
+// mli-notes.md.
+const CRef CRef_LazyRoot = RegionAllocator<uint32_t>::Ref_Undef - 2;
 class ClauseAllocator : public RegionAllocator<uint32_t>
 {
   static int clauseWord32Size(int size, bool has_extra)

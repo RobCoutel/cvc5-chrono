@@ -135,6 +135,8 @@ option(USE_KISSAT        "Use Kissat SAT solver")
 option(USE_MPFR          "Use MPFR for FP constant folding instead of SymFPU")
 option(USE_POLY          "Use LibPoly for polynomial arithmetic")
 option(USE_NORMALIZ      "Use Normaliz for liastar solver extension")
+option(USE_SATSENTINEL   "Use SATSentinel to monitor the MiniSat SAT solver")
+option(USE_SATSENTINEL_GUI "Build SATSentinel with its graphical frontend")
 
 # Custom install directories for dependencies
 # If no directory is provided by the user, we first check if the dependency was
@@ -605,6 +607,17 @@ if(USE_KISSAT)
   add_definitions(-DCVC5_USE_KISSAT)
 endif()
 
+# The graphical frontend is part of SATSentinel itself, so asking for it is
+# also asking for SATSentinel.
+if(USE_SATSENTINEL_GUI)
+  set(USE_SATSENTINEL ON)
+endif()
+
+if(USE_SATSENTINEL)
+  find_package(SATSentinel REQUIRED)
+  add_definitions(-DCVC5_USE_SATSENTINEL)
+endif()
+
 # disable libraries that cannot be used in safe mode
 if(ENABLE_SAFE_MODE)
   if(USE_POLY)
@@ -860,6 +873,8 @@ print_config("Kissat                    " ${USE_KISSAT} FOUND_SYSTEM ${Kissat_FO
 print_config("LibPoly                   " ${USE_POLY} FOUND_SYSTEM ${Poly_FOUND_SYSTEM})
 print_config("CoCoALib                  " ${USE_COCOA} FOUND_SYSTEM ${CoCoA_FOUND_SYSTEM})
 print_config("Normaliz                  " ${USE_NORMALIZ} FOUND_SYSTEM ${NORMALIZ_FOUND_SYSTEM})
+print_config("SATSentinel               " ${USE_SATSENTINEL} FOUND_SYSTEM ${SATSentinel_FOUND_SYSTEM})
+print_config("SATSentinel GUI           " ${USE_SATSENTINEL_GUI})
 
 if(CVC5_USE_CLN_IMP)
   print_config("MP library                " "cln" FOUND_SYSTEM ${CLN_FOUND_SYSTEM})

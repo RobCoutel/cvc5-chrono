@@ -71,6 +71,8 @@ The following flags enable optional packages (disable with --no-<option name>).
   --glpk                   use GLPK simplex solver
   --cryptominisat          use the CryptoMiniSat SAT solver
   --kissat                 use the Kissat SAT solver
+  --sat-sentinel           use SATSentinel to monitor the MiniSat SAT solver
+  --sat-sentinel-gui       build SATSentinel with its graphical frontend
   --poly                   use the LibPoly library [default=yes]
   --cocoa                  use the CoCoA library
   --editline               support the editline library
@@ -146,6 +148,8 @@ docs_ga=default
 glpk=default
 gpl=default
 kissat=default
+sat_sentinel=default
+sat_sentinel_gui=default
 poly=ON
 cocoa=default
 normaliz=default
@@ -270,6 +274,11 @@ do
     --kissat) kissat=ON;;
     --no-kissat) kissat=OFF;;
 
+    --sat-sentinel) sat_sentinel=ON;;
+    --no-sat-sentinel) sat_sentinel=OFF;;
+    --sat-sentinel-gui) sat_sentinel_gui=ON;;
+    --no-sat-sentinel-gui) sat_sentinel_gui=OFF;;
+
     --win64) win64=ON;;
 
     --win64-native) win64_native=ON;;
@@ -381,14 +390,14 @@ do
         esac
         ;;
 
-    --wasm) 
+    --wasm)
         if [ "$wasm_web" = default ]; then
           wasm=WASM
         else
           echo "Warning: --wasm ignored because --wasm-web configuration is active"
         fi
         ;;
-    --wasm=*) 
+    --wasm=*)
         if [ "$wasm_web" = default ]; then
           wasm="${1##*=}"
         else
@@ -396,14 +405,14 @@ do
         fi
         ;;
 
-    --wasm-flags) 
+    --wasm-flags)
         if [ "$wasm_web" = default ]; then
           die "missing argument to $1 (try -h)"
         else
           echo "Warning: --wasm-flags ignored because --wasm-web configuration is active"
         fi
         ;;
-    --wasm-flags=*) 
+    --wasm-flags=*)
         if [ "$wasm_web" = default ]; then
           wasm_flags="${1#*=}"
         else
@@ -520,6 +529,10 @@ fi
   && cmake_opts="$cmake_opts -DUSE_GLPK=$glpk"
 [ $kissat != default ] \
   && cmake_opts="$cmake_opts -DUSE_KISSAT=$kissat"
+[ $sat_sentinel != default ] \
+  && cmake_opts="$cmake_opts -DUSE_SATSENTINEL=$sat_sentinel"
+[ $sat_sentinel_gui != default ] \
+  && cmake_opts="$cmake_opts -DUSE_SATSENTINEL_GUI=$sat_sentinel_gui"
 [ $poly != default ] \
   && cmake_opts="$cmake_opts -DUSE_POLY=$poly"
 [ $cocoa != default ] \
@@ -540,6 +553,9 @@ fi
   && cmake_opts="$cmake_opts -DPROGRAM_PREFIX=$program_prefix"
 [ "$wasm" != default ] \
   && cmake_opts="$cmake_opts -DWASM=$wasm"
+
+cmake_opts="$cmake_opts -DCMAKE_C_COMPILER_LAUNCHER=ccache"
+cmake_opts="$cmake_opts -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 
 root_dir=$(pwd)
 

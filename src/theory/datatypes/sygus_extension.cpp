@@ -1382,6 +1382,11 @@ void SygusExtension::registerSizeTerm(Node e)
     return;
   }
   d_register_st[e] = true;
+  // registerTerm() also sets this for its own callers, but registerSizeTerm()
+  // may be reached directly (e.g. from check()) before that happens, so the
+  // anchor must be recorded here too or registerSearchValue() will later find
+  // no conjecture for this anchor.
+  d_anchor_to_conj[e] = d_tds->getConjectureForEnumerator(e);
   Node ag = d_tds->getActiveGuardForEnumerator(e);
   if (!ag.isNull())
   {

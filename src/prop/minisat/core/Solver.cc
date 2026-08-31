@@ -22,16 +22,22 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 #include <cmath>
 
+#include <algorithm>
 #include <iostream>
+#include <string>
+#include <sstream>
 #include <unordered_set>
 
 #include "base/check.h"
 #include "base/output.h"
+#include "options/booleans_options.h"
 #include "options/base_options.h"
 #include "options/main_options.h"
+#include "options/option_exception.h"
 #include "options/prop_options.h"
 #include "options/smt_options.h"
 #include "proof/clause_id.h"
+#include "prop/cnf_stream.h"
 #include "prop/minisat/minisat.h"
 #include "prop/minisat/mtl/Sort.h"
 #include "prop/theory_proxy.h"
@@ -206,13 +212,76 @@ Solver::Solver(Env& env,
       propagation_budget(-1),
       asynch_interrupt(false)
 {
+#ifdef CVC5_USE_SATSENTINEL
+  // Before anything else: the sentinel mirrors the state of the solver, so it must observe every
+  // notification, starting with the creation of the constant variables below.
+  createSentinel();
+  NOTIFY(message,
+         (std::string("Starting MiniSat with ")
+          + (options().booleans.chronologicalBacktracking ? "CB" : "NCB") + " and "
+          + (options().booleans.elevate ? "elevation" : "no elevation") + " and "
+          + (options().booleans.lazyReimplication ? "lazy reimplication" : "no lazy reimplication")));
+#endif
+
   // Create the constant variables
   varTrue = newVar(true, false, false);
   varFalse = newVar(false, false, false);
+  // Dedicated padding variable -- see the doc comment on the varPad member.
+  varPad = newVar(false, false, false);
 
   // Assert the constants
   uncheckedEnqueue(mkLit(varTrue, false));
   uncheckedEnqueue(mkLit(varFalse, true));
+  uncheckedEnqueue(mkLit(varPad, true));
+}
+
+#ifdef CVC5_USE_SATSENTINEL
+void Solver::createSentinel()
+{
+  const options::HolderPROP& opts = options().prop;
+  if (!opts.satSentinelWasSetByUser)
+  {
+    return;
+  }
+
+  // The two callbacks give the sentinel access to the cvc5 view of the variables and clauses, so
+  // that its display shows the SMT atoms rather than plain variable numbers. The variables cvc5
+  // creates for its own use (varTrue, varFalse) have no node attached, hence the lookup in the
+  // cache rather than a direct call to TheoryProxy::getNode().
+  d_sentinelState.create(
+      opts.satSentinel,
+      !options().booleans.chronologicalBacktracking,
+      !options().booleans.elevate,
+      [this](Var v) {
+        const prop::CnfStream::LiteralToNodeMap& nodes =
+            d_proxy->getCnfStream()->getNodeCache();
+        auto it = nodes.find(prop::SatLiteral(v));
+        if (it == nodes.end())
+        {
+          return std::string();
+        }
+        std::stringstream ss;
+        ss << it->second;
+        return ss.str();
+      },
+      [this](CRef cr) {
+        std::stringstream ss;
+        const Clause& c = ca[cr];
+        for (int i = 0; i < c.size(); ++i)
+        {
+          ss << (i == 0 ? "" : " ") << c[i] << "@" << level(var(c[i]));
+        }
+        return ss.str();
+      });
+}
+#endif /* CVC5_USE_SATSENTINEL */
+
+bool Solver::sentinelIsDecision() const
+{
+  // trail_lim records the trail position at which each level was opened, so the literal on top of
+  // the trail is a decision exactly when it sits at that position. Root level unit implications
+  // are also enqueued without a reason, but never open a level.
+  return trail_lim.size() > 0 && trail_lim.last() == trail.size() - 1;
 }
 
 void Solver::attachProofManager(prop::PropPfManager* ppm)
@@ -237,6 +306,7 @@ Var Solver::newVar(bool sign, bool dvar, bool isTheoryAtom)
     watches  .init(mkLit(v, true ));
     assigns  .push(l_Undef);
     vardata  .push(VarData(CRef_Undef, -1, -1, assertionLevel, -1));
+    d_lazyReason.push(CRef_Undef);
     activity .push(rnd_init_act ? drand(random_seed) * 0.00001 : 0);
     seen     .push(0);
     polarity .push(sign);
@@ -249,13 +319,37 @@ Var Solver::newVar(bool sign, bool dvar, bool isTheoryAtom)
 
     Trace("minisat") << "new var " << v << " with assertion level "
                      << assertionLevel << std::endl;
+#ifdef CVC5_USE_SATSENTINEL
+    d_sentinelState.newVar(v);
+#endif
     return v;
+}
+
+
+int Solver::computeClauseLevel(CRef cref) const
+{
+  Assert(cref != CRef_Undef);
+  if (cref == CRef_Lazy)
+    return decisionLevel();
+
+  const Clause& c = ca[cref];
+  Assert(c.size() > 0);
+  int lvl = 0;
+  int i = 0;
+  if (value(c[0]) == l_Undef)
+    i = 1;
+  for (; i < c.size(); ++i) {
+    Assert(value(c[i]) == l_False);
+    lvl = std::max(lvl, level(var(c[i])));
+  }
+  Assert(lvl <= decisionLevel());
+  return lvl;
 }
 
 void Solver::resizeVars(int newSize) {
   Assert(d_enable_incremental);
   Assert(decisionLevel() == 0);
-  Assert(newSize >= 2) << "always keep true/false";
+  Assert(newSize >= 3) << "always keep true/false/pad";
   if (newSize < nVars()) {
     int shrinkSize = nVars() - newSize;
 
@@ -265,6 +359,7 @@ void Solver::resizeVars(int newSize) {
     // Resize all info arrays
     assigns.shrink(shrinkSize);
     vardata.shrink(shrinkSize);
+    d_lazyReason.shrink(shrinkSize);
     activity.shrink(shrinkSize);
     seen.shrink(shrinkSize);
     polarity.shrink(shrinkSize);
@@ -333,6 +428,19 @@ CRef Solver::reason(Var x) {
   {
     int i, j, size;
     Lit prev = lit_Undef;
+    std::string explStr = "Lazy explanation : [";
+    for (i = 0, size = explanation.size(); i < size; ++i)
+    {
+      explStr += sign(explanation[i]) ? "" : "~";
+      explStr += std::to_string(var(explanation[i]));
+      if (i < size - 1)
+      {
+        explStr += " ";
+      }
+    }
+    explStr += "]";
+    NOTIFY(message, explStr, 4);
+
     for (i = 0, j = 0, size = explanation.size(); i < size; ++i)
     {
       // This clause is valid theory propagation, so its level is the level of
@@ -369,8 +477,8 @@ CRef Solver::reason(Var x) {
     // We need an explanation clause so we add a fake literal
     if (j == 1)
     {
-      // Add not TRUE to the clause
-      explanation.push(mkLit(varTrue, true));
+      // Add the dedicated padding literal to the clause -- see varPad.
+      explanation.push(mkLit(varPad, false));
     }
   }
 
@@ -389,6 +497,7 @@ CRef Solver::reason(Var x) {
       real_reason, level(x), user_level(x), intro_level(x), trail_index(x));
   clauses_removable.push(real_reason);
   attachClause(real_reason);
+  NOTIFY(update_reason, l, real_reason);
 
   return real_reason;
 }
@@ -396,7 +505,14 @@ CRef Solver::reason(Var x) {
 bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
 {
     if (!ok) return false;
-
+    std::string clause_string = "[";
+    for (int i = 0; i < ps.size(); ++i)
+    {
+      Lit lit = ps[i];
+      clause_string += (sign(lit) ? "" : "~") + std::to_string(var(lit)) + " ";
+    }
+    clause_string += "]";
+    NOTIFY(message, "Adding clause " + clause_string, 3);
     // Check if clause is satisfied and remove false/duplicate literals:
     sort(ps);
     Lit p; int i, j;
@@ -490,7 +606,6 @@ bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
 
       // If not unit, add the clause
       if (ps.size() > 1) {
-
         lemma_lt lt(*this);
         sort(ps, lt);
 
@@ -527,59 +642,166 @@ bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
       }
 
       // Check if it propagates
-      if (ps.size() == falseLiteralsCount + 1 && assigns[var(ps[0])] == l_Undef)
+      if (ps.size() == falseLiteralsCount + 1)
       {
-        Assert(assigns[var(ps[0])] != l_False);
-        uncheckedEnqueue(ps[0], cr);
-        Trace("pf::sat") << "Registering a unit clause " << ps[0]
-                         << ", maybe input, with assigned var value "
-                         << (assigns[var(ps[0])] == l_True
-                                 ? "true"
-                                 : (assigns[var(ps[0])] == l_False ? "false"
-                                                                   : "undef"))
-                         << ", user_level(" << user_level(var(ps[0])) << ")"
-                         << std::endl;
-        if (ps.size() == 1)
-        {
-          // We need to do this so that the closedness check, if being done,
-          // goes through when we have unit assumptions whose literal has
-          // already been registered, as the ProofCnfStream will not register
-          // them and as they are not the result of propagation will be left
-          // hanging in assumptions accumulator
-          if (needProof())
+        if (assigns[var(ps[0])] == l_Undef) {
+
+          Assert(assigns[var(ps[0])] != l_False);
+          // Level 0 clauses are not stored. We need a case split here to avoid calling computeClauseLevel on a clause that is not stored in the clause allocator.
+          uncheckedEnqueue(ps[0], cr,
+             cr == CRef_Undef ? 0 : computeClauseLevel(cr));
+          Trace("pf::sat") << "Registering a unit clause " << ps[0]
+                           << ", maybe input, with assigned var value "
+                           << (assigns[var(ps[0])] == l_True
+                                   ? "true"
+                                   : (assigns[var(ps[0])] == l_False ? "false"
+                                                                     : "undef"))
+                           << ", user_level(" << user_level(var(ps[0])) << ")"
+                           << std::endl;
+          if (ps.size() == 1)
           {
-            d_pfManager->registerSatLitAssumption(ps[0]);
+            // We need to do this so that the closedness check, if being done,
+            // goes through when we have unit assumptions whose literal has
+            // already been registered, as the ProofCnfStream will not register
+            // them and as they are not the result of propagation will be left
+            // hanging in assumptions accumulator
+            if (needProof())
+            {
+              d_pfManager->registerSatLitAssumption(ps[0]);
+            }
+            // Call notifySatClause. This call site handles unit clauses not
+            // learned in the standard way.
+            SatClause satClause;
+            satClause.push_back(MinisatSatSolver::toSatLiteral(ps[0]));
+            d_proxy->notifySatClause(satClause);
           }
-          // Call notifySatClause. This call site handles unit clauses not
-          // learned in the standard way.
-          SatClause satClause;
-          satClause.push_back(MinisatSatSolver::toSatLiteral(ps[0]));
-          d_proxy->notifySatClause(satClause);
-        }
-        CRef confl = propagate(CHECK_WITHOUT_THEORY);
-        if (!(ok = (confl == CRef_Undef)))
-        {
-          if (needProof())
+          CRef confl = propagate(CHECK_WITHOUT_THEORY);
+          if (!ok)
           {
-            if (ca[confl].size() == 1)
+            // A pending theory lemma already repaired a conflict all the way down to UNSAT
+            // inside propagate() (via updateLemmas()/repairConflict()) -- ok reflects the
+            // outcome directly, and any proof finalization needed already happened there;
+            // there is no separate CRef to act on here.
+            return false;
+          }
+          if (!(ok = (confl == CRef_Undef)))
+          {
+            if (needProof())
             {
-              d_pfManager->finalizeProof(ca[confl][0]);
-            }
-            else
-            {
-              d_pfManager->finalizeProof(ca[confl]);
+              if (ca[confl].size() == 1)
+              {
+                d_pfManager->finalizeProof(ca[confl][0]);
+              }
+              else
+              {
+                d_pfManager->finalizeProof(ca[confl]);
+              }
             }
           }
+          return ok;
         }
-        return ok;
       }
     }
     return true;
 }
 
 
-void Solver::attachClause(CRef cr) {
-    const Clause& c = ca[cr];
+int Solver::lazyImplicationLevel(CRef cr) const
+{
+  Assert(options().booleans.chronologicalBacktracking);
+  Assert(options().booleans.lazyReimplication);
+  if (cr == CRef_LazyRoot) return 0;
+  const Clause& c = ca[cr];
+  Assert(c.size() >= 2);
+  int lvl = level(var(c[1]));
+  for (int i = 1; i < c.size(); ++i) {
+    Assert(value(c[i]) == l_False);
+    Assert(level(var(c[i])) <= lvl);
+  }
+  return lvl;
+}
+
+void Solver::reimplyLit(Lit lit, CRef cr)
+{
+  Assert(options().booleans.chronologicalBacktracking);
+  Assert(cr != CRef_Undef);
+  Assert(cr != CRef_Lazy);
+  Assert(value(lit) == l_True);
+  Assert(cr == CRef_LazyRoot || lit == ca[cr][0]);
+
+  Var v = var(lit);
+
+  if (cr == CRef_LazyRoot) {
+    // create a bogus clause with the always false literal and the satisfied literal, so that we can reimply it at level 0
+    vec<Lit> clause;
+    clause.push(lit);
+    clause.push(mkLit(varPad, false));
+    cr = ca.alloc(0, clause, true);
+    attachClause(cr);
+  }
+
+  Assert(lit == ca[cr][0]);
+
+  // if the level of the satisfied literal is higher than the level of the first falsified literal, we have a missed lower implication
+  int reimplication_level = level(var(ca[cr][1]));
+  if (options().booleans.elevate) {
+    // in this option, it could be the reimplication_level is not correct.
+    // we need to recalculate it based on the trail index of the first falsified literal.
+    for (int i = 2; i < ca[cr].size(); ++i) {
+      reimplication_level = std::max(reimplication_level, level(var(ca[cr][i])));
+    }
+  }
+  if (level(v) <= reimplication_level)
+    return;
+
+  if (options().booleans.lazyReimplication) {
+    // check the level invariant
+    for (int i = 1; i < ca[cr].size(); ++i) {
+      Assert(value(ca[cr][i]) == l_False);
+      Assert(level(var(ca[cr][i])) <= level(var(ca[cr][1])));
+    }
+    // check the level of the current lazy reason
+    CRef lazyReason = d_lazyReason[v];
+    if (lazyReason == CRef_LazyRoot) {
+      // we cannot reimply lower than this level, so we do not need to do anything
+      return;
+    }
+    if (lazyReason != CRef_Undef && level(var(ca[lazyReason][1])) <= reimplication_level) {
+      // the current lazy reason is better than the new one, so we do not need to do anything
+      return;
+    }
+    d_lazyReason[v] = cr;
+  } else if (options().booleans.elevate) {
+    // check the level invariant
+    for (int i = 1; i < ca[cr].size(); ++i) {
+      Assert(value(ca[cr][i]) == l_False);
+      Assert(trail_index(var(ca[cr][i])) <= trail_index(var(ca[cr][1])));
+    }
+
+    // we need to check wether we can reimply the literal at a lower level.
+    // to do so, we check wether the the first falsified literal is located after the satisfied literal in the trail.
+    // if it is the case, then the repropagation will catch the missed lower implication and we do not need to do anything.
+    // otherwise, we can safely reimply the literal at the level of the first falsified literal.
+    // and it will not break the topological order
+    if (trail_index(var(ca[cr][1])) > trail_index(v)) {
+      // the repropagation will catch the missed lower implication, so we do not need to do anything
+      return;
+    }
+
+    // we can safely reimply the literal at the level of the first falsified literal.
+    vardata[v].d_level = reimplication_level;
+    vardata[v].d_reason = cr;
+    NOTIFY(update_reason, lit, cr);
+    NOTIFY(update_level, lit, reimplication_level);
+  }
+  else {
+    // do nothing
+  }
+
+}
+
+void Solver::attachClause(CRef cr, bool reattach) {
+    Clause& c = ca[cr];
     if (TraceIsOn("minisat"))
     {
       Trace("minisat") << "Solver::attachClause(" << c << "): ";
@@ -590,8 +812,81 @@ void Solver::attachClause(CRef cr) {
       Trace("minisat") << ", level " << c.level() << "\n";
     }
     Assert(c.size() > 1);
+
+#ifdef CVC5_USE_SATSENTINEL
+    // reattach is the caller's claim about whether the sentinel already knows cr (e.g.
+    // SimpSolver::strengthenClause()'s detach-shrink-reattach, which deliberately keeps the same
+    // identifier instead of going through removeClause()/deleteClause()). Don't trust that claim
+    // blindly: check it against the sentinel's own bookkeeping, so a CRef-reuse bug elsewhere
+    // (attaching a genuinely different clause under a stale, still-live identifier) fails loudly
+    // here instead of silently corrupting the sentinel's view of this clause's content. Only
+    // meaningful while a sentinel is actually attached at runtime (--sat-sentinel): when
+    // disabled, d_sentinelState's clause map is never populated, so knowsClause() would always
+    // read false regardless of cr and falsely reject every reattach.
+    Assert(!d_sentinelState || d_sentinelState.knowsClause(cr) == reattach)
+        << "attachClause(cr=" << cr << ", reattach=" << reattach
+        << "): disagrees with the sentinel's own bookkeeping of cr";
+    if (!reattach) {
+      // add_clause's precondition is that the clause not already exist; shrink_clause (already
+      // sent by strengthenClause() before this reattach) is what tells the sentinel about a
+      // reattached clause's new content instead.
+      NOTIFY(add_clause, cr, (const Lit*)c, c.size(), !c.removable());
+    }
+#endif
+
+    // sort the literals using literalUtility
+    // first we sort the first two literals, then we sort the rest of the literals based on their utility
+    if (literalUtility(c[1]) > literalUtility(c[0])) {
+      Lit tmp = c[1];
+      c[1] = c[0];
+      c[0] = tmp;
+    }
+    for (int i = 2; i < c.size(); ++i) {
+      int utility = literalUtility(c[i]);
+      if (utility > literalUtility(c[0])) {
+        // c[0], c[1],      c[i] <== c[i], c[0],     c[1]
+        Lit tmp = c[1];
+        c[1] = c[0];
+        c[0] = c[i];
+        c[i] = tmp;
+      } else if (utility > literalUtility(c[1])) {
+        // c[i] becomes c[1]
+        Lit tmp = c[1];
+        c[1] = c[i];
+        c[i] = tmp;
+      }
+    }
+
+    for (int i = 1; i < c.size(); ++i) {
+      Assert(literalUtility(c[i]) <= literalUtility(c[0]));
+      Assert(literalUtility(c[i]) <= literalUtility(c[1]));
+    }
+
+    for (int i = 1; i < c.size(); ++i) {
+      Assert(options().booleans.elevate
+       || value(c[0]) != l_False
+       || (value(c[i]) == l_False
+        && level(var(c[0])) >= level(var(c[i]))));
+      Assert(options().booleans.elevate
+       || value(c[1]) != l_False
+       || (value(c[i]) == l_False
+        && level(var(c[1])) >= level(var(c[i]))));
+      Assert(!options().booleans.elevate
+       || value(c[0]) != l_False
+       || (value(c[i]) == l_False
+        && trail_index(var(c[0])) >= trail_index(var(c[i]))));
+      Assert(!options().booleans.elevate
+       || value(c[1]) != l_False
+       || (value(c[i]) == l_False
+        && trail_index(var(c[1])) >= trail_index(var(c[i]))));
+    }
+
     watches[~c[0]].push(Watcher(cr, c[1]));
     watches[~c[1]].push(Watcher(cr, c[0]));
+    NOTIFY_WATCH(watch, cr, c[0]);
+    NOTIFY_WATCH(watch, cr, c[1]);
+    NOTIFY_WATCH(block, cr, c[1], c[0]);
+    NOTIFY_WATCH(block, cr, c[0], c[1]);
     if (c.removable()) learnts_literals += c.size();
     else            clauses_literals += c.size();
 }
@@ -621,6 +916,10 @@ void Solver::detachClause(CRef cr, bool strict) {
         watches.smudge(~c[0]);
         watches.smudge(~c[1]);
     }
+    // Whether the watchers are dropped now or on the next cleanAll(), the clause has stopped
+    // being watched as far as the invariants are concerned.
+    NOTIFY_WATCH(unwatch, cr, c[0]);
+    NOTIFY_WATCH(unwatch, cr, c[1]);
 
     if (c.removable()) learnts_literals -= c.size();
     else            clauses_literals -= c.size(); }
@@ -661,7 +960,15 @@ void Solver::removeClause(CRef cr) {
         d_pfManager->endResChain(c[0]);
       }
       vardata[var(c[0])].d_reason = CRef_Undef;
+      // c[0] stays on the trail but loses its justification. Report it as implied with an
+      // unavailable reason rather than as a decision, which is what CRef_Undef means here.
+      NOTIFY(update_reason, c[0], CRef_Lazy);
     }
+#ifdef CVC5_USE_SATSENTINEL
+    // Must come after the update above: the sentinel refuses to leave a literal pointing at a
+    // clause it no longer has.
+    d_sentinelState.deleteClause(cr);
+#endif
     c.mark(1);
     ca.free(cr);
 }
@@ -677,32 +984,119 @@ bool Solver::satisfied(const Clause& c) const {
 // Revert to the state at given level (keeping all assignment at 'level' but not beyond).
 //
 void Solver::cancelUntil(int level) {
-    Trace("minisat") << "minisat::cancelUntil(" << level << ")" << std::endl;
+  Assert(level >= 0);
+  Trace("minisat") << "minisat::cancelUntil(" << level << ")" << std::endl;
+  NOTIFY(message, "Backtracking " + std::to_string(decisionLevel()) + " --> " + std::to_string(level), 3);
 
-    if (decisionLevel() > level)
-    {
-      // Pop the SMT context
-      for (int l = trail_lim.size() - level; l > 0; --l)
-      {
-        d_context->pop();
-      }
-        for (int c = trail.size()-1; c >= trail_lim[level]; c--){
-            Var      x  = var(trail[c]);
-            assigns [x] = l_Undef;
-            vardata[x].d_trail_index = -1;
-            if ((phase_saving > 1 ||
-                 ((phase_saving == 1) && c > trail_lim.last())
-                 ) && ((polarity[x] & 0x2) == 0)) {
-              polarity[x] = sign(trail[c]);
-            }
-            insertVarOrder(x);
-        }
-        qhead = trail_lim[level];
-        trail.shrink(trail.size() - trail_lim[level]);
-        trail_lim.shrink(trail_lim.size() - level);
-        flipped.shrink(flipped.size() - level);
-        d_proxy->notifyBacktrack();
+  if (decisionLevel() <= level) {
+    return;
+  }
+  // cancelUntil() never widens level itself: every caller (analyze(), search(), updateLemmas())
+  // relies on it backtracking to *exactly* the requested level, no further -- silently doing
+  // more broke that contract for whichever in-flight computation assumed the smaller target
+  // (e.g. a just-learned clause's own literals, expected to stay l_False below it). Escalating
+  // to level 0 for a pending CRef_LazyRoot marker is instead the caller's job, done explicitly
+  // before it commits to a level: see analyze()'s abort path and mli-notes.md.
+  // Pop the SMT context
+  for (int l = trail_lim.size() - level; l > 0; --l)  {
+    d_context->pop();
+  }
+
+  // Everything from trail_lim[level] on is re-propagated below, so the literals that survive
+  // the backtrack go back into the propagation queue. Only those that had already been
+  // propagated need to be taken out of it. LSCB: literals being unassigned here (d_level above
+  // the target) that have a recorded missed lower implication whose true level falls within
+  // this backtrack are added here too, at that lower level, instead of just vanishing to be
+  // (maybe) rediscovered later.
+  std::vector<std::tuple<Lit, CRef, int>> toRequeue;
+  // they cannot coexist with the above, since that might violate the topological order after reimplication
+  std::vector<std::tuple<Lit, CRef, int>> toRequeueLazy;
+
+  // keep the assignments that are lower than the backtrack level
+  int trailSize = trail.size();
+  while (trailSize > trail_lim[level]) {
+    Lit l = trail[--trailSize];
+    Var x  = var(l);
+    if (vardata[x].d_level <= level) {
+      Assert(options().booleans.chronologicalBacktracking);
+      toRequeue.push_back(std::make_tuple(l, vardata[x].d_reason, vardata[x].d_level));
     }
+    else if (d_lazyReason[x] != CRef_Undef)
+    {
+      Assert(options().booleans.chronologicalBacktracking);
+      Assert(options().booleans.lazyReimplication);
+      int impliedLvl = lazyImplicationLevel(d_lazyReason[x]);
+      if (impliedLvl <= level)
+      {
+        CRef reimplyReason =
+            d_lazyReason[x] == CRef_LazyRoot ? CRef_Undef : d_lazyReason[x];
+        toRequeueLazy.push_back(std::make_tuple(l, reimplyReason, impliedLvl));
+      }
+      d_lazyReason[x] = CRef_Undef;
+    }
+    // Tied to this assignment episode; a fresh assignment of x later needs a fresh reason.
+    d_lazyReason[x] = CRef_Undef;
+
+    NOTIFY(unassign, l);
+    assigns [x] = l_Undef;
+    vardata[x].d_trail_index = -1;
+    vardata[x].d_level = -1;
+    if ((phase_saving > 1
+     || ((phase_saving == 1) && trailSize > trail_lim.last()))
+    && ((polarity[x] & 0x2) == 0)) {
+      polarity[x] = sign(l);
+    }
+    insertVarOrder(x);
+  }
+  qhead = std::min(qhead, trail_lim[level]);
+  if (options().booleans.chronologicalBacktracking
+      && !options().booleans.elevate
+      && !options().booleans.lazyReimplication) {
+    // we have to tell the observer that we need to repropagate everything at the SAT level to find all missed lower implications.
+    for (int i = qhead - 1; i > 0; --i) {
+      NOTIFY(unpropagate, trail[i]);
+    }
+    qhead = 0;
+  }
+  trail.shrink(trail.size() - trail_lim[level]);
+  trail_lim.shrink(trail_lim.size() - level);
+  flipped.shrink(flipped.size() - level);
+  d_proxy->notifyBacktrack();
+
+  // we now need to notify the proxy of all the assignment that are still on the trail, as they are now backtracked to and may be relevant for theory propagation
+  if (options().booleans.sortReimply) {
+    // Merge in trail order (toRequeue before toRequeueLazy at equal level, since
+    // stable_sort preserves the relative order of ties), then sort by level so that
+    // literals sharing a level end up contiguous while preserving topological order.
+    std::vector<std::tuple<Lit, CRef, int>> combined;
+    combined.reserve(toRequeue.size() + toRequeueLazy.size());
+    combined.insert(combined.end(), toRequeue.rbegin(), toRequeue.rend());
+    combined.insert(combined.end(), toRequeueLazy.rbegin(), toRequeueLazy.rend());
+    std::stable_sort(combined.begin(),
+                      combined.end(),
+                      [](const std::tuple<Lit, CRef, int>& a,
+                         const std::tuple<Lit, CRef, int>& b) {
+                        return std::get<2>(a) < std::get<2>(b);
+                      });
+    for (const std::tuple<Lit, CRef, int>& t : combined) {
+      uncheckedEnqueue(std::get<0>(t), std::get<1>(t), std::get<2>(t));
+    }
+  } else {
+    for (auto it = toRequeue.rbegin(); it != toRequeue.rend(); ++it) {
+      std::tuple<Lit, CRef, int> t = *it;
+      Lit l = std::get<0>(t);
+      CRef reason = std::get<1>(t);
+      int lvl = std::get<2>(t);
+      uncheckedEnqueue(l, reason, lvl);
+    }
+    for (auto it = toRequeueLazy.rbegin(); it != toRequeueLazy.rend(); ++it) {
+      std::tuple<Lit, CRef, int> t = *it;
+      Lit l = std::get<0>(t);
+      CRef reason = std::get<1>(t);
+      int lvl = std::get<2>(t);
+      uncheckedEnqueue(l, reason, lvl);
+    }
+  }
 }
 
 void Solver::resetTrail() { cancelUntil(0); }
@@ -842,9 +1236,27 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
 {
   Trace("pf::sat") << "Solver::analyze: starting with " << confl
                    << " with decision level " << decisionLevel() << "\n";
-
+  NOTIFY(message, "Analyzing conflict at level " + std::to_string(decisionLevel()), 3);
+  Assert(decisionLevel() > 0);
+  Assert(confl != CRef_Undef);
+  Assert(confl != CRef_Lazy);
+  Assert(confl != CRef_LazyRoot);
+  Assert(ca[confl].size() > 0);
   int pathC = 0;
   Lit p = lit_Undef;
+
+  if (options().booleans.chronologicalBacktracking) {
+    int conflict_level = computeClauseLevel(confl);
+    // we first need to backtrack to the level of the conflict clause, and then we will analyze the conflict
+    if (conflict_level < decisionLevel()) {
+      NOTIFY(message, "Backtracking to level " + std::to_string(conflict_level) + " to analyze conflict", 3);
+      cancelUntil(conflict_level);
+    }
+  }
+  // the conflict should be still conflicting
+  for (int i = 0; i < ca[confl].size(); ++i) {
+    Assert(value(ca[confl][i]) == l_False);
+  }
 
   // Generate conflict clause:
   //
@@ -920,10 +1332,14 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
         Trace("pf::sat") << cvc5::internal::pop;
 
         // Select next clause to look at:
-        while (!seen[var(trail[index--])]);
-        p     = trail[index+1];
+        do {
+          while (!seen[var(trail[index--])]);
+          p     = trail[index+1];
+          seen[var(p)] = 0;
+          // TODO: check if that is not always the case? For example, if only literals at the level of the conflict are seen
+          Assert(decisionLevel() == level(var(p)) || options().booleans.chronologicalBacktracking);
+        } while (decisionLevel() > level(var(p)));
         confl = reason(var(p));
-        seen[var(p)] = 0;
         pathC--;
 
         if (pathC > 0 && confl != CRef_Undef && needProof())
@@ -975,7 +1391,7 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
             }
         }
 
-    }else if (ccmin_mode == 1){
+    } else if (ccmin_mode == 1) {
         Unreachable();
         for (i = j = 1; i < out_learnt.size(); i++){
             Var x = var(out_learnt[i]);
@@ -990,8 +1406,9 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
                         break; }
             }
         }
-    }else
+    } else {
         i = j = out_learnt.size();
+    }
 
     max_literals += out_learnt.size();
     out_learnt.shrink(i - j);
@@ -999,9 +1416,12 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
 
     // Find correct backtrack level:
     //
-    if (out_learnt.size() == 1)
+    if (options().booleans.chronologicalBacktracking) {
+        out_btlevel = decisionLevel() - 1;
+    }
+    else if (out_learnt.size() == 1) {
         out_btlevel = 0;
-    else{
+    } else {
         int max_i = 1;
         // Find the first literal assigned at the next-highest level:
         for (int k = 2; k < out_learnt.size(); k++)
@@ -1086,8 +1506,9 @@ void Solver::analyzeFinal(Lit p, vec<Lit>& out_conflict)
         Var x = var(trail[i]);
         if (seen[x]){
             if (reason(x) == CRef_Undef){
-              Assert(level(x) > 0);
-              out_conflict.push(~trail[i]);
+              if (level(x) > 0) {
+                out_conflict.push(~trail[i]);
+              }
             }else{
                 Clause& c = ca[reason(x)];
                 for (int j = 1; j < c.size(); j++)
@@ -1101,27 +1522,27 @@ void Solver::analyzeFinal(Lit p, vec<Lit>& out_conflict)
     seen[var(p)] = 0;
 }
 
-void Solver::uncheckedEnqueue(Lit p, CRef from)
+void Solver::uncheckedEnqueue(Lit p, CRef from, int level)
 {
-  if (TraceIsOn("minisat"))
-  {
+  Assert(level >= 0);
+  Assert(level <= decisionLevel());
+  // Without CB, callers deliberately enqueue at decisionLevel() instead of the clause's
+  // own computeClauseLevel() to keep the trail level-monotonic; both are valid here.
+  Assert(from == CRef_Undef || from == CRef_Lazy || level == computeClauseLevel(from)
+         || (!options().booleans.chronologicalBacktracking && level == decisionLevel()));
+  Assert(options().booleans.chronologicalBacktracking || level == decisionLevel());
+  if (TraceIsOn("minisat")) {
     Trace("minisat") << "unchecked enqueue of " << p << " ("
                      << trail_index(var(p)) << ") trail size is "
                      << trail.size() << " cap is " << trail.capacity()
                      << ", assertion level is " << assertionLevel
                      << ", reason is " << from << ", ";
-    if (from == CRef_Lazy)
-    {
+    if (from == CRef_Lazy) {
       Trace("minisat") << "CRef_Lazy";
-    }
-    else if (from == CRef_Undef)
-    {
+    } else if (from == CRef_Undef) {
       Trace("minisat") << "CRef_Undef";
-    }
-    else
-    {
-      for (unsigned i = 0, size = ca[from].size(); i < size; ++i)
-      {
+    } else {
+      for (unsigned i = 0, size = ca[from].size(); i < size; ++i) {
         Trace("minisat") << ca[from][i] << " ";
       }
     }
@@ -1130,14 +1551,14 @@ void Solver::uncheckedEnqueue(Lit p, CRef from)
   Assert(value(p) == l_Undef);
   Assert(var(p) < nVars());
   assigns[var(p)] = lbool(!sign(p));
-  vardata[var(p)] = VarData(
-      from, decisionLevel(), assertionLevel, intro_level(var(p)), trail.size());
+  vardata[var(p)] = VarData(from, level, assertionLevel, intro_level(var(p)), trail.size());
   trail.push_(p);
-  if (theory[var(p)])
-  {
+  if (theory[var(p)]) {
     // Enqueue to the theory
     d_proxy->enqueueTheoryLiteral(MinisatSatSolver::toSatLiteral(p));
   }
+  NOTIFY(assign, p, vardata[var(p)].d_level, from);
+
 }
 
 CRef Solver::propagate(TheoryCheckType type)
@@ -1148,7 +1569,11 @@ CRef Solver::propagate(TheoryCheckType type)
 
     ScopedBool scoped_bool(minisat_busy, true);
 
-    // Add lemmas that we're left behind
+    // Add lemmas that were left behind. Any conflict a lemma causes is now fully repaired
+    // internally by updateLemmas() (via repairConflict()) -- it never comes back out as an
+    // unresolved CRef the way it used to. 'ok' is the only signal that it concluded UNSAT; every
+    // call site below must check it, not just the (now always CRef_Undef in that case) return
+    // value.
     if (lemmas.size() > 0) {
       confl = updateLemmas();
       if (confl != CRef_Undef) {
@@ -1240,7 +1665,7 @@ void Solver::propagateTheory() {
     // multiple theories can propagate the same literal
     Lit p = propagatedLiterals[i];
     if (value(p) == l_Undef) {
-      uncheckedEnqueue(p, CRef_Lazy);
+      uncheckedEnqueue(p, CRef_Lazy, decisionLevel());
     } else {
       if (value(p) == l_False) {
         Trace("minisat") << "Conflict in theory propagation" << std::endl;
@@ -1289,7 +1714,7 @@ CRef Solver::propagateBool()
     watches.cleanAll();
 
     while (qhead < trail.size()){
-        Lit            p   = trail[qhead++];     // 'p' is enqueued fact to propagate.
+        Lit            p   = trail[qhead];     // 'p' is enqueued fact to propagate.
         vec<Watcher>&  ws  = watches[p];
         Watcher        *i, *j, *end;
         num_props++;
@@ -1302,7 +1727,10 @@ CRef Solver::propagateBool()
         }
 
         for (i = j = (Watcher*)ws, end = i + ws.size();  i != end;){
-            // Try to avoid inspecting the clause:
+            // Try to avoid inspecting the clause -- but under LSCB, a blocker that is satisfied
+            // at a level higher than the literal we are propagating false is exactly a missed
+            // lower implication (the blocker optimization is precisely what can hide one: see
+            // mli-notes.md), so it is not safe to skip on that basis alone there.
             Lit blocker = i->blocker;
             if (value(blocker) == l_True){
                 *j++ = *i++; continue; }
@@ -1316,10 +1744,12 @@ CRef Solver::propagateBool()
             Assert(c[1] == false_lit);
             i++;
 
-            // If 0th watch is true, then clause is already satisfied.
+            // If 0th watch is true at a safe level, then clause is already satisfied.
             Lit     first = c[0];
             Watcher w     = Watcher(cr, first);
-            if (first != blocker && value(first) == l_True){
+            if (value(first) == l_True){
+                // The watcher survives with 'first' recorded as its new blocker.
+                NOTIFY_WATCH(block, cr, first, false_lit);
                 *j++ = w; continue; }
 
             // Look for new watch:
@@ -1327,23 +1757,32 @@ CRef Solver::propagateBool()
             for (int k = 2; k < c.size(); k++)
                 if (value(c[k]) != l_False){
                     c[1] = c[k]; c[k] = false_lit;
+                    // The clause stops watching the falsified literal and watches c[1] instead.
+                    NOTIFY_WATCH(unwatch, cr, false_lit);
+                    NOTIFY_WATCH(watch, cr, c[1]);
+                    NOTIFY_WATCH(block, cr, first, c[1]);
                     watches[~c[1]].push(w);
                     goto NextClause; }
 
-            // Did not find watch -- clause is unit under assignment:
+            // Did not find a replacement watch.
+            NOTIFY_WATCH(block, cr, first, false_lit);
             *j++ = w;
             if (value(first) == l_False){
+                // Clause is unit under assignment -- conflict.
                 confl = cr;
-                qhead = trail.size();
                 // Copy the remaining watches:
                 while (i < end)
                     *j++ = *i++;
-            }else
-                uncheckedEnqueue(first, cr);
+            } else {
+                Assert(value(first) == l_Undef);
+                uncheckedEnqueue(first, cr, computeClauseLevel(cr));
+            }
 
         NextClause:;
         }
         ws.shrink(i - j);
+        NOTIFY(propagate, trail[qhead]);
+        qhead++;
     }
     propagations += num_props;
     simpDB_props -= num_props;
@@ -1443,7 +1882,10 @@ bool Solver::simplify()
 {
   Assert(decisionLevel() == 0);
 
-  if (!ok || propagate(CHECK_WITHOUT_THEORY) != CRef_Undef) return ok = false;
+  // propagate() returns CRef_Undef even when a pending theory lemma repaired a conflict all
+  // the way down to UNSAT internally (via updateLemmas()/repairConflict()) -- ok must be
+  // checked again after the call, not just before.
+  if (!ok || propagate(CHECK_WITHOUT_THEORY) != CRef_Undef || !ok) return ok = false;
 
   if (nAssigns() == simpDB_assigns || (simpDB_props > 0)) return true;
 
@@ -1465,6 +1907,135 @@ bool Solver::simplify()
 
 /*_________________________________________________________________________________________________
 |
+|  repairConflict : (confl : CRef)  ->  [bool]
+|
+|  Description:
+|    Repairs a single conflict, whatever its origin (BCP/search(), or a theory lemma via
+|    updateLemmas()): analyzes it, backtracks, learns and attaches the resulting clause, and
+|    enqueues its asserting literal, looping internally if the learnt clause is itself still
+|    conflicting at the new, lower level. Never returns with an unresolved conflict.
+|
+|  Output:
+|    false iff repairing this conflict concluded the formula is UNSAT ('ok' is set to false and,
+|    if needed, the proof is finalized). true once the conflict is fully resolved.
+|________________________________________________________________________________________________@*/
+bool Solver::repairConflict(CRef confl)
+{
+  Assert(confl != CRef_Undef);
+  Assert(confl != CRef_Lazy || decisionLevel() == 0);
+  int backtrack_level;
+  vec<Lit> learnt_clause;
+  while (confl != CRef_Undef)
+  {
+    conflicts++;
+    NOTIFY(message,
+            "Conflict at level " + std::to_string(decisionLevel()),
+            3);
+    int conflict_level = options().booleans.chronologicalBacktracking ?
+                           computeClauseLevel(confl) :
+                           decisionLevel();
+    if (conflict_level == 0)
+    {
+      if (needProof())
+      {
+        cancelUntil(0);
+        if (confl == CRef_Lazy)
+        {
+          d_pfManager->finalizeProof();
+        }
+        else
+        {
+          d_pfManager->finalizeProof(ca[confl]);
+        }
+      }
+      return (ok = false);
+    }
+
+    // Analyze the conflict
+    learnt_clause.clear();
+    int max_level = analyze(confl, learnt_clause, backtrack_level);
+    cancelUntil(backtrack_level);
+
+    // cancelUntil() above can have reimplied one of learnt_clause's falsified literals
+    // (indices 1..) at a lower level than it had when analyze() sorted the clause, via a
+    // pending lazy reimplication -- leaving c[1] no longer the highest-level literal among
+    // the antecedents. attachClause() relies on that ordering for the second watched literal.
+    // Re-sort just the antecedents (everything but the asserting/UIP literal at index 0) by
+    // decreasing level to restore it.
+    if (learnt_clause.size() > 1)
+    {
+      sort(&learnt_clause[1],
+           learnt_clause.size() - 1,
+           [this](Lit a, Lit b) { return level(var(a)) > level(var(b)); });
+    }
+
+    // Assert the conflict clause and the asserting literal
+    if (learnt_clause.size() == 1) {
+      if (value(learnt_clause[0]) == l_Undef) {
+        uncheckedEnqueue(learnt_clause[0]);
+        confl = CRef_Undef;
+      } else if (level(var(learnt_clause[0])) == 0) {
+        // This is a conflict at level 0, which means the problem is UNSAT
+        if (needProof())
+        {
+          cancelUntil(0);
+          d_pfManager->finalizeProof();
+        }
+        return (ok = false);
+      } else {
+        Assert(options().booleans.chronologicalBacktracking);
+        cancelUntil(level(var(learnt_clause[0])) - 1);
+        uncheckedEnqueue(learnt_clause[0]);
+        confl = CRef_Undef;
+      }
+      if (needProof())
+      {
+        d_pfManager->endResChain(learnt_clause[0]);
+      }
+      // Call notifySatClause here.
+      SatClause satClause;
+      satClause.push_back(MinisatSatSolver::toSatLiteral(learnt_clause[0]));
+      d_proxy->notifySatClause(satClause);
+    } else { // learnt_clause.size() > 1
+      CRef cr = ca.alloc(assertionLevelOnly() ?
+                           assertionLevel :
+                           max_level,
+                         learnt_clause,
+                         true);
+      // Call notifySatClause here.
+      SatClause satClause;
+      MinisatSatSolver::toSatClause(ca[cr], satClause);
+      d_proxy->notifySatClause(satClause);
+      clauses_removable.push(cr);
+
+      attachClause(cr);
+      claBumpActivity(ca[cr]);
+      if (value(learnt_clause[0]) == l_Undef) {
+        uncheckedEnqueue(learnt_clause[0], cr, computeClauseLevel(cr));
+        confl = CRef_Undef;
+      } else {
+        confl = cr;
+      }
+      if (needProof())
+      {
+        d_pfManager->endResChain(ca[cr]);
+        if (TraceIsOn("pf::sat") && ca[cr].level() < assertionLevel)
+        {
+          Trace("pf::sat")
+              << "learnt_clause: " << ca[cr] << " clause/assert levels "
+              << ca[cr].level() << " / " << assertionLevel << "\n";
+        }
+      }
+    }
+
+    varDecayActivity();
+    claDecayActivity();
+  }
+  return true;
+}
+
+/*_________________________________________________________________________________________________
+|
 |  search : (nof_conflicts : int) (params : const SearchParams&)  ->  [lbool]
 |
 |  Description:
@@ -1479,9 +2050,7 @@ bool Solver::simplify()
 lbool Solver::search(int nof_conflicts)
 {
   Assert(ok);
-  int backtrack_level;
   int conflictC = 0;
-  vec<Lit> learnt_clause;
   starts++;
 
   TheoryCheckType check_type = CHECK_WITH_THEORY;
@@ -1491,72 +2060,17 @@ lbool Solver::search(int nof_conflicts)
     CRef confl = propagate(check_type);
     Assert(lemmas.size() == 0);
 
-    if (confl != CRef_Undef)
+    bool conflicting = (confl != CRef_Undef);
+    if (conflicting)
     {
-      conflicts++;
-      conflictC++;
-
-      if (decisionLevel() == 0)
-      {
-        if (needProof())
-        {
-          if (confl == CRef_Lazy)
-          {
-            d_pfManager->finalizeProof();
-          }
-          else
-          {
-            d_pfManager->finalizeProof(ca[confl]);
-          }
-        }
+      if (!repairConflict(confl)) {
+        NOTIFY(message, "Solved with answer: UNSAT (failed to repair)", 1);
         return l_False;
       }
-
-      // Analyze the conflict
-      learnt_clause.clear();
-      int max_level = analyze(confl, learnt_clause, backtrack_level);
-      cancelUntil(backtrack_level);
-
-      // Assert the conflict clause and the asserting literal
-      if (learnt_clause.size() == 1)
-      {
-        uncheckedEnqueue(learnt_clause[0]);
-        if (needProof())
-        {
-          d_pfManager->endResChain(learnt_clause[0]);
-        }
-        // Call notifySatClause here.
-        SatClause satClause;
-        satClause.push_back(MinisatSatSolver::toSatLiteral(learnt_clause[0]));
-        d_proxy->notifySatClause(satClause);
-      }
-      else
-      {
-        CRef cr = ca.alloc(assertionLevelOnly() ? assertionLevel : max_level,
-                           learnt_clause,
-                           true);
-        // Call notifySatClause here.
-        SatClause satClause;
-        MinisatSatSolver::toSatClause(ca[cr], satClause);
-        d_proxy->notifySatClause(satClause);
-        clauses_removable.push(cr);
-        attachClause(cr);
-        claBumpActivity(ca[cr]);
-        uncheckedEnqueue(learnt_clause[0], cr);
-        if (needProof())
-        {
-          d_pfManager->endResChain(ca[cr]);
-          if (TraceIsOn("pf::sat") && ca[cr].level() < assertionLevel)
-          {
-            Trace("pf::sat")
-                << "learnt_clause: " << ca[cr] << " clause/assert levels "
-                << ca[cr].level() << " / " << assertionLevel << "\n";
-          }
-        }
-      }
-
-      varDecayActivity();
-      claDecayActivity();
+      // Restart-schedule bookkeeping: counted once per conflict propagate() surfaced here (a
+      // BCP conflict), not once per repairConflict()'s internal retry -- a minor pacing
+      // difference from before, not a correctness concern.
+      conflictC++;
 
       if (--learntsize_adjust_cnt == 0)
       {
@@ -1579,100 +2093,109 @@ lbool Solver::search(int nof_conflicts)
 
       check_type = CHECK_WITH_THEORY;
     }
-    else
+    if (conflicting) {
+      continue;
+    }
+
+    // Propagation ran to a fixpoint without a conflict, which is where the invariants on the
+    // trail and on the watched literals are meant to hold.
+    NOTIFY(check_invariants);
+
+    // If this was a final check, we are satisfiable
+    if (check_type == CHECK_FINAL)
     {
-      // If this was a final check, we are satisfiable
-      if (check_type == CHECK_FINAL)
+      // Note that we are done making decisions when there are no pending decisions
+      // on assumptions, and the decision engine indicates it is done.
+      bool decisionEngineDone = (decisionLevel() >= assumptions.size())
+                                && d_proxy->isDecisionEngineDone();
+      // Unless a lemma has added more stuff to the queues
+      if (!decisionEngineDone
+          && (!order_heap.empty() || qhead < trail.size()))
       {
-        // Note that we are done making decisions when there are no pending decisions
-        // on assumptions, and the decision engine indicates it is done.
-        bool decisionEngineDone = (decisionLevel() >= assumptions.size())
-                                  && d_proxy->isDecisionEngineDone();
-        // Unless a lemma has added more stuff to the queues
-        if (!decisionEngineDone
-            && (!order_heap.empty() || qhead < trail.size()))
-        {
-          check_type = CHECK_WITH_THEORY;
-          continue;
-        }
-        else if (recheck)
-        {
-          // There some additional stuff added, so we go for another
-          // full-check
-          continue;
-        }
-        else
-        {
-          // Yes, we're truly satisfiable
-          return l_True;
-        }
+        check_type = CHECK_WITH_THEORY;
+        continue;
       }
-
-      if ((nof_conflicts >= 0 && conflictC >= nof_conflicts)
-          || !withinBudget(Resource::SatConflictStep))
+      else if (recheck)
       {
-        // Reached bound on number of conflicts:
-        progress_estimate = progressEstimate();
-        cancelUntil(0);
-        // [mdeters] notify theory engine of restarts for deferred
-        // theory processing
-        d_proxy->notifyRestart();
-        return l_Undef;
+        // There some additional stuff added, so we go for another
+        // full-check
+        continue;
       }
-
-      // Simplify the set of problem clauses:
-      if (decisionLevel() == 0 && !simplify())
+      else
       {
+        // Yes, we're truly satisfiable
+        NOTIFY(message, "Solved with answer: SAT", 1);
+        return l_True;
+      }
+    }
+
+    if ((nof_conflicts >= 0 && conflictC >= nof_conflicts)
+        || !withinBudget(Resource::SatConflictStep))
+    {
+      // Reached bound on number of conflicts:
+      progress_estimate = progressEstimate();
+      cancelUntil(0);
+      // [mdeters] notify theory engine of restarts for deferred
+      // theory processing
+      d_proxy->notifyRestart();
+      NOTIFY(message, "Solved with answer: UNKNOWN", 1);
+      return l_Undef;
+    }
+
+    // Simplify the set of problem clauses:
+    if (decisionLevel() == 0 && !simplify())
+    {
+      NOTIFY(message, "Solved with answer: UNSAT", 1);
+      return l_False;
+    }
+
+    if (clauses_removable.size() - nAssigns() >= max_learnts)
+    {
+      // Reduce the set of learnt clauses:
+      reduceDB();
+    }
+
+    Lit next = lit_Undef;
+    while (decisionLevel() < assumptions.size())
+    {
+      // Perform user provided assumption:
+      Lit p = assumptions[decisionLevel()];
+      if (value(p) == l_True)
+      {
+        // Dummy decision level:
+        NOTIFY(message, "Assumption " + MinisatSatSolver::toSatLiteral(p).toString() + " already satisfied. Creating dummy level.", 3);
+        newDecisionLevel();
+      }
+      else if (value(p) == l_False)
+      {
+        analyzeFinal(~p, d_conflict);
         return l_False;
       }
-
-      if (clauses_removable.size() - nAssigns() >= max_learnts)
+      else
       {
-        // Reduce the set of learnt clauses:
-        reduceDB();
+        next = p;
+        break;
       }
+    }
 
-      Lit next = lit_Undef;
-      while (decisionLevel() < assumptions.size())
-      {
-        // Perform user provided assumption:
-        Lit p = assumptions[decisionLevel()];
-        if (value(p) == l_True)
-        {
-          // Dummy decision level:
-          newDecisionLevel();
-        }
-        else if (value(p) == l_False)
-        {
-          analyzeFinal(~p, d_conflict);
-          return l_False;
-        }
-        else
-        {
-          next = p;
-          break;
-        }
-      }
+    if (next == lit_Undef)
+    {
+      // New variable decision:
+      next = pickBranchLit();
 
       if (next == lit_Undef)
       {
-        // New variable decision:
-        next = pickBranchLit();
-
-        if (next == lit_Undef)
-        {
-          // We need to do a full theory check to confirm
-          Trace("minisat::search")
-              << "Doing a full theory check..." << std::endl;
-          check_type = CHECK_FINAL;
-          continue;
-        }
+        // We need to do a full theory check to confirm
+        Trace("minisat::search")
+            << "Doing a full theory check..." << std::endl;
+        check_type = CHECK_FINAL;
+        continue;
       }
-
-      // Increase decision level and enqueue 'next'
-      newDecisionLevel();
-      uncheckedEnqueue(next);
     }
+
+    // Increase decision level and enqueue 'next'
+    newDecisionLevel();
+    uncheckedEnqueue(next, CRef_Undef, decisionLevel());
   }
 }
 
@@ -1865,6 +2388,16 @@ void Solver::toDimacs(FILE* f)
 
 void Solver::relocAll(ClauseAllocator& to)
 {
+#ifdef CVC5_USE_SATSENTINEL
+    // Taken before the lists below are rewritten in place, so that each clause can be matched
+    // with the reference it moves to. See SentinelState::relocate().
+    vec<CRef> oldRemovable, oldPersistent;
+    if (d_sentinelState)
+    {
+      clauses_removable.copyTo(oldRemovable);
+      clauses_persistent.copyTo(oldPersistent);
+    }
+#endif
     // All watchers:
     //
     // for (int i = 0; i < watches.size(); i++)
@@ -1890,6 +2423,13 @@ void Solver::relocAll(ClauseAllocator& to)
         {
           ca.reloc(vardata[v].d_reason, to);
         }
+        // A recorded missed lower implication clause is a GC root just like a reason clause:
+        // cancelUntil() may still dereference it through d_lazyReason to reimplyLit v, so it must
+        // survive relocation even though nothing else may be keeping it alive.
+        if (d_lazyReason[v] != CRef_Undef)
+        {
+          ca.reloc(d_lazyReason[v], to);
+        }
     }
     // All learnt:
     //
@@ -1903,6 +2443,15 @@ void Solver::relocAll(ClauseAllocator& to)
     {
       ca.reloc(clauses_persistent[i], to);
     }
+#ifdef CVC5_USE_SATSENTINEL
+    // Every live clause has been relocated by now. Done here rather than in garbageCollect()
+    // because SimpSolver overrides that but still routes through here.
+    if (d_sentinelState)
+    {
+      d_sentinelState.relocate(
+          oldRemovable, clauses_removable, oldPersistent, clauses_persistent);
+    }
+#endif
 }
 
 
@@ -1954,8 +2503,10 @@ void Solver::pop()
     Trace("minisat") << "== unassigning " << trail.last() << std::endl;
     Var      x  = var(trail.last());
     if (user_level(x) > assertionLevel) {
+      NOTIFY(unassign, trail.last());
       assigns[x] = l_Undef;
       vardata[x] = VarData(CRef_Undef, -1, -1, intro_level(x), -1);
+      d_lazyReason[x] = CRef_Undef;
       if(phase_saving >= 1 && (polarity[x] & 0x2) == 0)
         polarity[x] = sign(trail.last());
       insertVarOrder(x);
@@ -1966,6 +2517,13 @@ void Solver::pop()
   }
 
   // The head should be at the trail top
+  // NOTIFY is a no-op with no sentinel attached, so the increment must not live inside its
+  // (conditionally evaluated) argument -- otherwise qhead never advances and this loop never
+  // terminates.
+  while (qhead < trail.size()) {
+    NOTIFY(propagate, trail[qhead]);
+    ++qhead;
+  }
   qhead = trail.size();
 
   // Remove the clauses
@@ -2016,13 +2574,28 @@ CRef Solver::updateLemmas() {
       }
       Trace("pf::sat") << std::endl;
 
+      std::string msg = "Solver::updateLemmas(): processing lemma: [";
+      for (int k = 0; k < lemma.size(); ++k) {
+        msg += sign(lemma[k]) ? "-" : "";
+        msg += std::to_string(var(lemma[k]));
+        if (k < lemma.size() - 1) {
+          msg += " ";
+        }
+      }
+      msg += "]";
+      NOTIFY(message, msg, 8);
+
       // If it's an empty lemma, we have a conflict at zero level
       if (lemma.size() == 0) {
+        NOTIFY(message, "Found empty lemma", 2);
+        cancelUntil(0);
         Assert(!options().smt.produceUnsatCores && !needProof());
-        conflict = CRef_Lazy;
-        backtrackLevel = 0;
         Trace("minisat::lemmas") << "Solver::updateLemmas(): found empty clause" << std::endl;
-        continue;
+        // Clear the lemmas
+        lemmas.clear();
+        lemmas_removable.clear();
+        theoryConflict = true;
+        return CRef_Lazy;
       }
       // Sort the lemma to be able to attach
       sort(lemma, lt);
@@ -2030,11 +2603,36 @@ CRef Solver::updateLemmas() {
       if (lemma.size() == 1 || value(lemma[1]) == l_False) {
         Trace("minisat::lemmas") << "found unit " << lemma.size() << std::endl;
         // This lemma propagates, see which level we need to backtrack to
-        int currentBacktrackLevel = lemma.size() == 1 ? 0 : level(var(lemma[1]));
-        // Even if the first literal is true, we should propagate it at this level (unless it's set at a lower level)
-        if (value(lemma[0]) != l_True || level(var(lemma[0])) > currentBacktrackLevel) {
-          if (currentBacktrackLevel < backtrackLevel) {
-            backtrackLevel = currentBacktrackLevel;
+        if (options().booleans.chronologicalBacktracking) {
+          if (value(lemma[0]) == l_False) {
+            // this is a conflict. We need to backtrack to the level of the first literal minus one
+            if (lemma.size() == 1 && level(var(lemma[0])) == 0) {
+              // A unit lemma conflicting at level 0 never reaches the attach loop below
+              // (unit lemmas get no clause), so finalizeProof() has nothing to resolve
+              // from unless we record which literal this conflict is about here, same as
+              // the general unit-conflict case below.
+              NOTIFY(message, "Found conflict at level 0", 2);
+              if (needProof()) {
+                d_pfManager->storeUnitConflict(lemma[0]);
+              }
+              Trace("minisat::lemmas") << "Solver::updateLemmas(): found conflict at level 0" << std::endl;
+              // Clear the lemmas
+              lemmas.clear();
+              lemmas_removable.clear();
+              theoryConflict = true;
+              cancelUntil(0);
+              return CRef_Lazy;
+            }
+            backtrackLevel = std::min(backtrackLevel, std::max(level(var(lemma[0])) - 1, 0));
+          }
+          // we can now deal with missed lower implications. No need to backtrack
+        } else {
+          int currentBacktrackLevel = lemma.size() == 1 ? 0 : level(var(lemma[1]));
+          // in NCB, we cannot deal with misser lower implications. We would need to backtrack to the appropriate level.
+          if (value(lemma[0]) != l_True || level(var(lemma[0])) > currentBacktrackLevel) {
+            if (currentBacktrackLevel < backtrackLevel) {
+              backtrackLevel = currentBacktrackLevel;
+            }
           }
         }
       }
@@ -2045,18 +2643,16 @@ CRef Solver::updateLemmas() {
     cancelUntil(backtrackLevel);
   }
 
-  // Last index in the trail
-  int backtrack_index = trail.size();
-
   // Attach all the clauses and enqueue all the propagations
   for (int j = 0; j < lemmas.size(); ++j)
   {
     // The current lemma
     vec<Lit>& lemma = lemmas[j];
+    sort(lemma, lt);
     bool removable = lemmas_removable[j];
 
     // Attach it if non-unit
-    CRef lemma_ref = CRef_Undef;
+    CRef lemma_ref = CRef_Lazy;
     if (lemma.size() > 1) {
       // If the lemmas is removable, we can compute its level by the level
       int clauseLevel = assertionLevel;
@@ -2096,28 +2692,65 @@ CRef Solver::updateLemmas() {
       attachClause(lemma_ref);
     }
 
-    // If the lemma is propagating enqueue its literal (or set the conflict)
-    if (conflict == CRef_Undef && value(lemma[0]) != l_True) {
-      if (lemma.size() == 1 || (value(lemma[1]) == l_False && trail_index(var(lemma[1])) < backtrack_index)) {
-        Trace("pf::sat") << "Solver::updateLemmas: unit theory lemma: "
-                         << lemma[0] << std::endl;
-        if (value(lemma[0]) == l_False) {
-          // We have a conflict
-          if (lemma.size() > 1) {
-            Trace("minisat::lemmas") << "Solver::updateLemmas(): conflict" << std::endl;
-            conflict = lemma_ref;
-          } else {
-            Trace("minisat::lemmas") << "Solver::updateLemmas(): unit conflict or empty clause" << std::endl;
-            conflict = CRef_Lazy;
-            if (needProof())
-            {
-              d_pfManager->storeUnitConflict(lemma[0]);
-            }
+    std::string lemmaStr = "[";
+        for (int k = 0; k < lemma.size(); ++k) {
+          lemmaStr += sign(lemma[k]) ? "-" : "";
+          lemmaStr += std::to_string(var(lemma[k]));
+          if (k < lemma.size() - 1) {
+            lemmaStr += " ";
           }
-        } else {
-          Trace("minisat::lemmas") << "lemma size is " << lemma.size() << std::endl;
-          Trace("minisat::lemmas") << "lemma ref is " << lemma_ref << std::endl;
-          uncheckedEnqueue(lemma[0], lemma_ref);
+        }
+        lemmaStr += "]";
+    if (value(lemma[0]) == l_False) {
+      // We have a conflict
+      NOTIFY(message, "Found lemma conflict " + lemmaStr, 5);
+      conflict = lemma_ref;
+      if (lemma.size() == 1 && needProof())
+      {
+        // A unit lemma gets no clause (lemma_ref stays CRef_Lazy), so
+        // finalizeProof() has nothing to resolve from unless we record which
+        // literal this conflict is about here.
+        d_pfManager->storeUnitConflict(lemma[0]);
+      }
+    } else if (lemma.size() == 1 || value(lemma[1]) == l_False) {
+      if (value(lemma[0]) == l_Undef) {
+        int lvl = lemma.size() == 1 ? 0 : level(var(lemma[1]));
+        if (lemma.size() == 1)
+        {
+          // This unit lemma's justification is already fully known here (a
+          // unit lemma has no premises left to re-derive), so attach a real
+          // clause now instead of leaving the reason as CRef_Lazy. Otherwise
+          // reason() would defer to d_proxy->explainPropagation() on demand
+          // later -- and under CB, that call can be asked about a variable
+          // whose theory-side state has since diverged from what justified
+          // this exact propagation (e.g. reimplied to the opposite polarity
+          // in between), producing a stale/self-contradictory explanation.
+          // Same padding trick reason() itself uses when an explanation
+          // shrinks to one real literal (search "fake literal" above).
+          int clauseLevel = assertionLevel;
+          if (removable && !assertionLevelOnly())
+          {
+            clauseLevel = std::max(0, intro_level(var(lemma[0])));
+          }
+          vec<Lit> paddedClause;
+          paddedClause.push(lemma[0]);
+          paddedClause.push(mkLit(varPad, false));
+          lemma_ref = ca.alloc(clauseLevel, paddedClause, removable);
+          if (removable) {
+            clauses_removable.push(lemma_ref);
+          } else {
+            clauses_persistent.push(lemma_ref);
+          }
+          attachClause(lemma_ref);
+        }
+        uncheckedEnqueue(lemma[0], lemma_ref, lvl);
+      } else {
+        Assert(value(lemma[0]) == l_True);
+        NOTIFY(message, "Found missed lower implication in lemma" + lemmaStr, 5);
+        if (lemma.size() == 1 && level(var(lemma[0])) > 0) {
+          reimplyLit(lemma[0], CRef_LazyRoot);
+        } else if (lemma.size() > 1 && level(var(lemma[0])) > level(var(lemma[1]))) {
+          reimplyLit(lemma[0], lemma_ref);
         }
       }
     }

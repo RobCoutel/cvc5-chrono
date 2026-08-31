@@ -163,7 +163,7 @@ name   = "SMT Layer"
   long       = "produce-unsat-cores"
   type       = "bool"
   default    = "false"
-  help       = "turn on unsat core generation. Unless otherwise specified, cores will be produced using SAT soving under assumptions and preprocessing proofs."
+  help       = "turn on unsat core generation. Unless otherwise specified, cores will be produced using SAT solving under assumptions and preprocessing proofs."
 
 [[option]]
   name       = "unsatCoresMode"

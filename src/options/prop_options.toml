@@ -6,7 +6,7 @@ name   = "SAT Layer"
   category   = "common"
   long       = "sat-solver=MODE"
   type       = "SatSolverMode"
-  default    = "CADICAL"
+  default    = "MINISAT"
   help       = "choose which sat solver to use, see --sat-solver=help"
   help_mode  = "CDCL(T) SAT solver backend."
 [[option.mode.MINISAT]]
@@ -108,3 +108,11 @@ name   = "SAT Layer"
 [[option.mode.LAZY]]
   name = "lazy"
   help = "Preregister literals when they are asserted by the SAT solver."
+
+[[option]]
+  name       = "satSentinel"
+  category   = "expert"
+  long       = "sat-sentinel=ARGS"
+  type       = "std::string"
+  default    = '""'
+  help       = "monitor MiniSat with SATSentinel, which mirrors the state of the solver and checks its invariants (requires a build configured with --sat-sentinel). Passing this option at all turns monitoring on, even with an empty ARGS. ARGS is forwarded to SATSentinel's own option parser verbatim, e.g. `--sat-sentinel { --gui }` to run its graphical frontend or `--sat-sentinel { --check-implied-levels }` to enable an invariant check; wrap multiple SATSentinel flags in `{ ... }` since they would otherwise be parsed as cvc5's own options. See SATSentinel's Sentinel-options.hpp for the full list of flags ARGS accepts"

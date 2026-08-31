@@ -1,3 +1,34 @@
 id     = "BOOLEANS"
 name   = "Boolean Theory"
 
+[[option]]
+  name       = "chronologicalBacktracking"
+  category   = "expert"
+  long       = "chronological-backtracking"
+  type       = "bool"
+  default    = "true"
+  help       = "enable chronological backtracking, which backtracks to the highest decision level minus one, instead of the second highest decision level, when a conflict is detected."
+
+[[option]]
+  name       = "elevate"
+  category   = "expert"
+  long       = "elevate"
+  type       = "bool"
+  default    = "true"
+  help       = "When a missed lower implication is added to the solver incrementally, fix the level of the implied literal without backtracking."
+
+[[option]]
+  name       = "lazyReimplication"
+  category   = "expert"
+  long       = "lscb"
+  type       = "bool"
+  default    = "false"
+  help       = "Enable lazy reimplication of literals, which allows the solver to delay the re-evaluation of certain implications until they are needed."
+
+[[option]]
+  name       = "sortReimply"
+  category   = "expert"
+  long       = "sort-reimply"
+  type       = "bool"
+  default    = "false"
+  help       = "When re-enqueuing literals kept across a backtrack, stable-sort them by their (re)implied level instead of their previous trail order, so literals sharing a level land as a contiguous run. Stability preserves topological order among literals at the same level; lazily reimplied literals are ordered after non-lazily-requeued literals at the same level."

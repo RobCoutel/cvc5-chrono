@@ -238,14 +238,20 @@ bool SimpSolver::strengthenClause(CRef cr, Lit l)
         c.strengthen(l);
     }else{
         detachClause(cr, true);
+        // Announce the shrink while the clause is still the one the sentinel knows: after
+        // strengthen() the literal is gone, and attachClause() below re-watches the shorter
+        // clause under the identifier it already has.
+        NOTIFY(shrink_clause, cr, l);
         c.strengthen(l);
-        attachClause(cr);
+        attachClause(cr, /*reattach=*/true);
         remove(occurs[var(l)], cr);
         n_occ[toInt(l)]--;
         updateElimHeap(var(l));
     }
 
-    return c.size() == 1 ? enqueue(c[0]) && propagate(CHECK_WITHOUT_THEORY) == CRef_Undef : true;
+    return c.size() == 1
+               ? enqueue(c[0]) && propagate(CHECK_WITHOUT_THEORY) == CRef_Undef
+               : true;
 }
 
 

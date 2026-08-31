@@ -66,8 +66,35 @@ Node SatProofManager::getClauseNode(const Minisat::Clause& clause)
   std::vector<Node> clauseNodes;
   for (size_t i = 0, size = clause.size(); i < size; ++i)
   {
-    SatLiteral satLit = MinisatSatSolver::toSatLiteral(clause[i]);
+    Minisat::Lit lit = clause[i];
+    // Under chronological backtracking, a clause that is really just a
+    // single justified literal may have been padded with a dedicated,
+    // permanently-false literal so that MiniSat's clause representation
+    // (which requires size >= 2) can back it -- see reason()'s on-demand
+    // explanation, reimplyLit()'s elevate branch, and updateLemmas()'s
+    // padding of a newly unit-propagating lemma, all in Solver.cc. Unlike an
+    // earlier version of this check, this variable (Solver::varPad) is
+    // dedicated *solely* to this padding and is never exposed to CnfStream
+    // for genuine CNF/theory content (unlike varTrue/varFalse, which *are*
+    // shared with the real Boolean constants and so cannot be filtered out
+    // this way -- doing so previously silently corrupted the proof Node of
+    // genuine lemmas that happened to mention them). So this literal never
+    // resolves against anything else in the proof, and including it here
+    // would surface an unprovable "padVar" leaf; the clause's proof-relevant
+    // content is just its real literal(s), same as for a genuine unit fact.
+    if (Minisat::var(lit) == d_solver->padVar())
+    {
+      continue;
+    }
+    SatLiteral satLit = MinisatSatSolver::toSatLiteral(lit);
     clauseNodes.push_back(d_cnfStream->getNode(satLit));
+  }
+  Assert(!clauseNodes.empty());
+  if (clauseNodes.size() == 1)
+  {
+    // A unit clause is represented at the proof level as its bare literal
+    // node, not as a unary OR (matching e.g. finalizeProof(Lit, bool)).
+    return clauseNodes[0];
   }
   // order children by node id
   std::sort(clauseNodes.begin(), clauseNodes.end());
@@ -337,6 +364,14 @@ void SatProofManager::processRedundantLit(
   std::vector<SatLiteral> toProcess;
   for (unsigned i = 1, size = reason.size(); i < size; ++i)
   {
+    // Unlike explainLit() (which walks getClauseNode()'s already-filtered
+    // Node), this walks the raw clause, so it must skip a padding literal
+    // (see getClauseNode()) itself -- recursing into it would ask for its
+    // reason/explanation as if it were a genuine fact, which it is not.
+    if (Minisat::var(reason[i]) == d_solver->padVar())
+    {
+      continue;
+    }
     toProcess.push_back(MinisatSatSolver::toSatLiteral(reason[i]));
   }
   Node clauseNode = getClauseNode(reason);

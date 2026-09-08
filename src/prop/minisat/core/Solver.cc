@@ -2134,15 +2134,20 @@ CRef Solver::updateLemmas() {
       // See if the lemma propagates something
       if (lemma.size() == 1 || value(lemma[1]) == l_False) {
         Trace("minisat::lemmas") << "found unit " << lemma.size() << std::endl;
-        // This lemma propagates, see which level we need to backtrack to
-        int currentBacktrackLevel = options().booleans.chronologicalBacktracking ?
-                                      std::max(level(var(lemma[0])) - 1, 0):
-                                      lemma.size() == 1 ?
-                                        0 : level(var(lemma[1]));
-        // Even if the first literal is true, we should propagate it at this level (unless it's set at a lower level)
-        if (value(lemma[0]) != l_True || level(var(lemma[0])) > currentBacktrackLevel) {
-          if (currentBacktrackLevel < backtrackLevel) {
-            backtrackLevel = currentBacktrackLevel;
+        if (options().booleans.chronologicalBacktracking) {
+          int currentBacktrackLevel = std::max(level(var(lemma[0])) - 1, 0);
+          if (value(lemma[0]) == l_False  // conflict
+          || (value(lemma[0]) == l_True && level(var(lemma[0])) > currentBacktrackLevel)) {  // missed lower implication
+            // we do not backtrack for implications now.
+            // we only backtrack for missed lower implication and conflicts
+            backtrackLevel = std::min(backtrackLevel, currentBacktrackLevel);
+          }
+        } else {
+          // This lemma propagates, see which level we need to backtrack to
+          int currentBacktrackLevel = lemma.size() == 1 ? 0 : level(var(lemma[1]));
+          // Even if the first literal is true, we should propagate it at this level (unless it's set at a lower level)
+          if (value(lemma[0]) != l_True || level(var(lemma[0])) > currentBacktrackLevel) {
+            backtrackLevel = std::min(backtrackLevel, currentBacktrackLevel);
           }
         }
       }

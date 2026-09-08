@@ -189,7 +189,7 @@ class Solver : protected EnvObj
       // Literals of the same value are sorted by decreasing levels
       if (x_value == y_value)
       {
-        return d_solver.trail_index(var(x)) > d_solver.trail_index(var(y));
+        return d_solver.level(var(x)) > d_solver.level(var(y));
       }
       else
       {
@@ -511,7 +511,7 @@ class Solver : protected EnvObj
   Lit pickBranchLit();      // Return the next decision variable.
   void newDecisionLevel();  // Begins a new decision level.
   void uncheckedEnqueue(
-      Lit p, CRef from = CRef_Undef);  // Enqueue a literal. Assumes value of
+      Lit p, CRef from = CRef_Undef, int level=0);  // Enqueue a literal. Assumes value of
                                        // literal is undefined.
   bool enqueue(Lit p,
                CRef from = CRef_Undef);  // Test if fact 'p' contradicts current
@@ -574,6 +574,9 @@ class Solver : protected EnvObj
 
   void relocAll(ClauseAllocator& to);
 
+  int literalUtility(Lit lit);
+  void bringBestWatches(CRef cr);
+
   // Misc:
   //
   int decisionLevel() const;  // Gives the current decisionlevel.
@@ -581,6 +584,7 @@ class Solver : protected EnvObj
       const;  // Used to represent an abstraction of sets of decision levels.
   CRef reason(Var x);  // Get the reason of the variable (non const as it might
                        // create the explanation on the fly)
+  int computeClauseLevel(CRef cref) const; // Compute the level of a clause (the maximum level of its literals)
   bool hasReasonClause(Var x) const;  // Does the variable have a reason
   bool isPropagated(
       Var x) const;  // Does the variable have a propagated variables

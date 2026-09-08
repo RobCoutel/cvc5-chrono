@@ -30,6 +30,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include "options/base_options.h"
 #include "options/main_options.h"
 #include "options/prop_options.h"
+#include "options/booleans_options.h"
 #include "options/smt_options.h"
 #include "proof/clause_id.h"
 #include "prop/minisat/minisat.h"
@@ -385,12 +386,69 @@ CRef Solver::reason(Var x) {
   }
   // Construct the reason
   CRef real_reason = ca.alloc(explLevel, explanation, true);
-  vardata[x] = VarData(
-      real_reason, level(x), user_level(x), intro_level(x), trail_index(x));
+  vardata[x].d_reason = real_reason;
+  if (options().booleans.chronologicalBacktracking) {
+    Assert(value(ca[real_reason][0]) == l_True);
+    Assert(value(ca[real_reason][1]) == l_False);
+    Assert(computeClauseLevel(real_reason) == level(var(ca[real_reason][1])));
+    vardata[x].d_level = level(var(ca[real_reason][1]));
+  }
   clauses_removable.push(real_reason);
   attachClause(real_reason);
 
   return real_reason;
+}
+
+int Solver::computeClauseLevel(CRef cref) const
+{
+  Assert(cref != CRef_Undef);
+  if (cref == CRef_Lazy)
+    return decisionLevel();
+
+  const Clause& c = ca[cref];
+  Assert(c.size() > 0);
+  int lvl = 0;
+  int i = value(c[0]) != l_False ? 1 : 0;
+  for (; i < c.size(); ++i) {
+    Assert(value(c[i]) == l_False);
+    lvl = std::max(lvl, level(var(c[i])));
+  }
+  Assert(lvl <= decisionLevel());
+  return lvl;
+}
+int Solver::literalUtility(Lit lit)
+{
+  if (value(lit) == l_True) {
+    return 0x7FFFFFFF;
+  } else if (value(lit) == l_Undef) {
+    return 0x7FFFFFFE;
+  }
+  return level(var(lit));
+}
+
+void Solver::bringBestWatches(CRef cr)
+{
+  Clause& c = ca[cr];
+  if (literalUtility(c[1]) > literalUtility(c[0])) {
+    Lit tmp = c[1];
+    c[1] = c[0];
+    c[0] = tmp;
+  }
+  for (int i = 2; i < c.size(); ++i) {
+    int utility = literalUtility(c[i]);
+    if (utility > literalUtility(c[0])) {
+      // c[0], c[1],      c[i] <== c[i], c[0],     c[1]
+      Lit tmp = c[1];
+      c[1] = c[0];
+      c[0] = c[i];
+      c[i] = tmp;
+    } else if (utility > literalUtility(c[1])) {
+      // c[i] becomes c[1]
+      Lit tmp = c[1];
+      c[1] = c[i];
+      c[i] = tmp;
+    }
+  }
 }
 
 bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
@@ -530,7 +588,7 @@ bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
       if (ps.size() == falseLiteralsCount + 1 && assigns[var(ps[0])] == l_Undef)
       {
         Assert(assigns[var(ps[0])] != l_False);
-        uncheckedEnqueue(ps[0], cr);
+        uncheckedEnqueue(ps[0], cr, cr == CRef_Undef ? 0 : computeClauseLevel(cr));
         Trace("pf::sat") << "Registering a unit clause " << ps[0]
                          << ", maybe input, with assigned var value "
                          << (assigns[var(ps[0])] == l_True
@@ -677,32 +735,55 @@ bool Solver::satisfied(const Clause& c) const {
 // Revert to the state at given level (keeping all assignment at 'level' but not beyond).
 //
 void Solver::cancelUntil(int level) {
-    Trace("minisat") << "minisat::cancelUntil(" << level << ")" << std::endl;
+  Trace("minisat") << "minisat::cancelUntil(" << level << ")" << std::endl;
 
-    if (decisionLevel() > level)
-    {
-      // Pop the SMT context
-      for (int l = trail_lim.size() - level; l > 0; --l)
-      {
-        d_context->pop();
-      }
-        for (int c = trail.size()-1; c >= trail_lim[level]; c--){
-            Var      x  = var(trail[c]);
-            assigns [x] = l_Undef;
-            vardata[x].d_trail_index = -1;
-            if ((phase_saving > 1 ||
-                 ((phase_saving == 1) && c > trail_lim.last())
-                 ) && ((polarity[x] & 0x2) == 0)) {
-              polarity[x] = sign(trail[c]);
-            }
-            insertVarOrder(x);
-        }
-        qhead = trail_lim[level];
-        trail.shrink(trail.size() - trail_lim[level]);
-        trail_lim.shrink(trail_lim.size() - level);
-        flipped.shrink(flipped.size() - level);
-        d_proxy->notifyBacktrack();
+  Assert(level >= 0);
+  Trace("minisat") << "minisat::cancelUntil(" << level << ")" << std::endl;
+
+  if (decisionLevel() <= level) {
+    return;
+  }
+
+  for (int l = trail_lim.size() - level; l > 0; --l)  {
+    d_context->pop();
+  }
+
+  std::vector<std::tuple<Lit, CRef, int>> toRequeue;
+
+  // keep the assignments that are lower than the backtrack level
+  int trailSize = trail.size();
+  while (trailSize > trail_lim[level]) {
+    Lit l = trail[--trailSize];
+    Var x  = var(l);
+    if (vardata[x].d_level <= level) {
+      Assert(options().booleans.chronologicalBacktracking);
+      toRequeue.push_back(std::make_tuple(l, vardata[x].d_reason, vardata[x].d_level));
     }
+
+    assigns [x] = l_Undef;
+    vardata[x].d_trail_index = -1;
+    vardata[x].d_level = -1;
+    if ((phase_saving > 1
+     || ((phase_saving == 1) && trailSize > trail_lim.last()))
+    && ((polarity[x] & 0x2) == 0)) {
+      polarity[x] = sign(l);
+    }
+    insertVarOrder(x);
+  }
+  qhead = std::min(qhead, trail_lim[level]);
+  trail.shrink(trail.size() - trail_lim[level]);
+  trail_lim.shrink(trail_lim.size() - level);
+  flipped.shrink(flipped.size() - level);
+  d_proxy->notifyBacktrack();
+
+  // we now need to notify the proxy of all the assignment that are still on the trail, as they are now backtracked to and may be relevant for theory propagation
+  for (auto it = toRequeue.rbegin(); it != toRequeue.rend(); ++it) {
+    std::tuple<Lit, CRef, int> t = *it;
+    Lit l = std::get<0>(t);
+    CRef reason = std::get<1>(t);
+    int lvl = std::get<2>(t);
+    uncheckedEnqueue(l, reason, lvl);
+  }
 }
 
 void Solver::resetTrail() { cancelUntil(0); }
@@ -887,6 +968,7 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
              j++)
         {
           Lit q = ca[confl][j];
+          Assert(value(q) == l_False);
 
           Trace("pf::sat") << "Lit " << q
                            << " seen/level: " << (seen[var(q)] ? 1 : 0) << " / "
@@ -920,11 +1002,44 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
         Trace("pf::sat") << cvc5::internal::pop;
 
         // Select next clause to look at:
-        while (!seen[var(trail[index--])]);
-        p     = trail[index+1];
-        confl = reason(var(p));
-        seen[var(p)] = 0;
-        pathC--;
+        do {
+          while (!seen[var(trail[index--])]);
+          Assert(index >= 0);
+          p     = trail[index+1];
+          // in CB, out-of-order literals should not be resolved
+          if (level(var(p)) < decisionLevel())
+            continue;
+          confl = reason(var(p));
+          pathC--;
+          // in CB, the reason could update the decision level of p
+          // maybe p is now at a lower level and we should not resolve it
+          if (level(var(p)) < decisionLevel()) {
+            out_learnt.push(~p);
+            if (pathC == 0) {
+              // the level of the conflict was actually lower than we thought. We need to backtrack to that level and continue the analysis.
+              Assert(options().booleans.chronologicalBacktracking);
+              // find the highest level of the literals in out_learnt
+              int max_level = 0;
+              for (int i = 1; i < out_learnt.size(); ++i)
+                max_level = std::max(max_level, level(var(out_learnt[i])));
+              cancelUntil(max_level);
+              // now we need to remove the literals in out_learnt that are at the max_level
+              for (int i = 1; i < out_learnt.size(); ++i) {
+                Assert(value(out_learnt[i]) == l_False);
+                if (level(var(out_learnt[i])) == max_level) {
+                  out_learnt[i] = out_learnt.last();
+                  out_learnt.pop();
+                  i--;
+                  pathC++;
+                }
+              }
+              index = trail.size() - 1;
+            }
+            continue;
+          }
+          seen[var(p)] = 0;
+          break;
+        } while (true);
 
         if (pathC > 0 && confl != CRef_Undef && needProof())
         {
@@ -999,9 +1114,11 @@ int Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
 
     // Find correct backtrack level:
     //
-    if (out_learnt.size() == 1)
+    if (options().booleans.chronologicalBacktracking)
+        out_btlevel = decisionLevel() - 1;
+    else if (out_learnt.size() == 1) {
         out_btlevel = 0;
-    else{
+    } else {
         int max_i = 1;
         // Find the first literal assigned at the next-highest level:
         for (int k = 2; k < out_learnt.size(); k++)
@@ -1086,8 +1203,8 @@ void Solver::analyzeFinal(Lit p, vec<Lit>& out_conflict)
         Var x = var(trail[i]);
         if (seen[x]){
             if (reason(x) == CRef_Undef){
-              Assert(level(x) > 0);
-              out_conflict.push(~trail[i]);
+              if (level(x) > 0)
+                out_conflict.push(~trail[i]);
             }else{
                 Clause& c = ca[reason(x)];
                 for (int j = 1; j < c.size(); j++)
@@ -1101,7 +1218,7 @@ void Solver::analyzeFinal(Lit p, vec<Lit>& out_conflict)
     seen[var(p)] = 0;
 }
 
-void Solver::uncheckedEnqueue(Lit p, CRef from)
+void Solver::uncheckedEnqueue(Lit p, CRef from, int lvl)
 {
   if (TraceIsOn("minisat"))
   {
@@ -1131,7 +1248,7 @@ void Solver::uncheckedEnqueue(Lit p, CRef from)
   Assert(var(p) < nVars());
   assigns[var(p)] = lbool(!sign(p));
   vardata[var(p)] = VarData(
-      from, decisionLevel(), assertionLevel, intro_level(var(p)), trail.size());
+      from, lvl, assertionLevel, intro_level(var(p)), trail.size());
   trail.push_(p);
   if (theory[var(p)])
   {
@@ -1240,7 +1357,7 @@ void Solver::propagateTheory() {
     // multiple theories can propagate the same literal
     Lit p = propagatedLiterals[i];
     if (value(p) == l_Undef) {
-      uncheckedEnqueue(p, CRef_Lazy);
+      uncheckedEnqueue(p, CRef_Lazy, decisionLevel());
     } else {
       if (value(p) == l_False) {
         Trace("minisat") << "Conflict in theory propagation" << std::endl;
@@ -1339,7 +1456,7 @@ CRef Solver::propagateBool()
                 while (i < end)
                     *j++ = *i++;
             }else
-                uncheckedEnqueue(first, cr);
+                uncheckedEnqueue(first, cr, computeClauseLevel(cr));
 
         NextClause:;
         }
@@ -1495,9 +1612,13 @@ lbool Solver::search(int nof_conflicts)
     {
       conflicts++;
       conflictC++;
-
-      if (decisionLevel() == 0)
+    int conflict_level = options().booleans.chronologicalBacktracking ?
+                           computeClauseLevel(confl) :
+                           decisionLevel();
+    if (conflict_level == 0)
       {
+        unsat_result:
+        cancelUntil(0);
         if (needProof())
         {
           if (confl == CRef_Lazy)
@@ -1514,9 +1635,18 @@ lbool Solver::search(int nof_conflicts)
 
       // Analyze the conflict
       learnt_clause.clear();
+      if (options().booleans.chronologicalBacktracking) {
+        cancelUntil(conflict_level);
+      }
       int max_level = analyze(confl, learnt_clause, backtrack_level);
+      if (backtrack_level < 0) {
+        goto unsat_result;
+      }
       cancelUntil(backtrack_level);
 
+      Assert(learnt_clause.size() > 0);
+      Assert(value(learnt_clause[0]) == l_Undef);
+      Assert(learnt_clause.size() == 1 || value(learnt_clause[1]) == l_False);
       // Assert the conflict clause and the asserting literal
       if (learnt_clause.size() == 1)
       {
@@ -1542,7 +1672,7 @@ lbool Solver::search(int nof_conflicts)
         clauses_removable.push(cr);
         attachClause(cr);
         claBumpActivity(ca[cr]);
-        uncheckedEnqueue(learnt_clause[0], cr);
+        uncheckedEnqueue(learnt_clause[0], cr, computeClauseLevel(cr));
         if (needProof())
         {
           d_pfManager->endResChain(ca[cr]);
@@ -1671,7 +1801,7 @@ lbool Solver::search(int nof_conflicts)
 
       // Increase decision level and enqueue 'next'
       newDecisionLevel();
-      uncheckedEnqueue(next);
+      uncheckedEnqueue(next, CRef_Undef, decisionLevel());
     }
   }
 }
@@ -2030,7 +2160,10 @@ CRef Solver::updateLemmas() {
       if (lemma.size() == 1 || value(lemma[1]) == l_False) {
         Trace("minisat::lemmas") << "found unit " << lemma.size() << std::endl;
         // This lemma propagates, see which level we need to backtrack to
-        int currentBacktrackLevel = lemma.size() == 1 ? 0 : level(var(lemma[1]));
+        int currentBacktrackLevel = options().booleans.chronologicalBacktracking ?
+                                      std::max(level(var(lemma[0])) - 1, 0):
+                                      lemma.size() == 1 ?
+                                        0 : level(var(lemma[1]));
         // Even if the first literal is true, we should propagate it at this level (unless it's set at a lower level)
         if (value(lemma[0]) != l_True || level(var(lemma[0])) > currentBacktrackLevel) {
           if (currentBacktrackLevel < backtrackLevel) {
@@ -2117,7 +2250,8 @@ CRef Solver::updateLemmas() {
         } else {
           Trace("minisat::lemmas") << "lemma size is " << lemma.size() << std::endl;
           Trace("minisat::lemmas") << "lemma ref is " << lemma_ref << std::endl;
-          uncheckedEnqueue(lemma[0], lemma_ref);
+          int impl_lvl = lemma_ref == CRef_Undef ? 0 : computeClauseLevel(lemma_ref);
+          uncheckedEnqueue(lemma[0], lemma_ref, impl_lvl);
         }
       }
     }

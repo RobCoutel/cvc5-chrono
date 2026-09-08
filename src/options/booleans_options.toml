@@ -1,3 +1,10 @@
 id     = "BOOLEANS"
 name   = "Boolean Theory"
 
+[[option]]
+  name       = "chronologicalBacktracking"
+  category   = "expert"
+  long       = "chronological-backtracking"
+  type       = "bool"
+  default    = "true"
+  help       = "enable chronological backtracking, which backtracks to the highest decision level minus one, instead of the second highest decision level, when a conflict is detected."

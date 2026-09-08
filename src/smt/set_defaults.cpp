@@ -1027,6 +1027,27 @@ void SetDefaults::setDefaultsPost(const LogicInfo& logic, Options& opts) const
     SET_AND_NOTIFY_IF_NOT_USER_VAL_SYM(
         arith, nlExt, options::NlExtMode::FULL, "logic with transcendentals");
   }
+  bool cbValidatedLogic = !isSygus(opts) && !logic.isQuantified()
+                          && !logic.isHigherOrder()
+                          && !logic.isTheoryEnabled(THEORY_ARRAYS)
+                          && !logic.isTheoryEnabled(THEORY_DATATYPES)
+                          && !logic.isTheoryEnabled(THEORY_SEP)
+                          && !logic.isTheoryEnabled(THEORY_SETS)
+                          && !logic.isTheoryEnabled(THEORY_BAGS)
+                          && !logic.isTheoryEnabled(THEORY_STRINGS)
+                          && !logic.isTheoryEnabled(THEORY_FF)
+                          && !logic.isTheoryEnabled(THEORY_FP)
+                          && (!logic.isTheoryEnabled(THEORY_ARITH)
+                              || (logic.isLinear()
+                                  && !logic.areTranscendentalsUsed()));
+  if (!cbValidatedLogic)
+  {
+    SET_AND_NOTIFY_IF_NOT_USER(
+        booleans,
+        chronologicalBacktracking,
+        false,
+        "logic outside quantifier-free UF/linear arithmetic/BV");
+  }
   if (isOutputOn(OutputTag::NORMALIZE))
   {
     SET_AND_NOTIFY(base, preprocessOnly, true, "normalize output");

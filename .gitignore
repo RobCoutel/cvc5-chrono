@@ -17,3 +17,6 @@ generated/
 *.pyc
 
 
+.cb-bench/*
+build-release/*
+build-assert/*

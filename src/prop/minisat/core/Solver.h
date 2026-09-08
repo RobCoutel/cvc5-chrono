@@ -575,7 +575,6 @@ class Solver : protected EnvObj
   void relocAll(ClauseAllocator& to);
 
   int literalUtility(Lit lit);
-  void bringBestWatches(CRef cr);
 
   // Misc:
   //

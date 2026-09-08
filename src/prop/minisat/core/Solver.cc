@@ -426,31 +426,6 @@ int Solver::literalUtility(Lit lit)
   return level(var(lit));
 }
 
-void Solver::bringBestWatches(CRef cr)
-{
-  Clause& c = ca[cr];
-  if (literalUtility(c[1]) > literalUtility(c[0])) {
-    Lit tmp = c[1];
-    c[1] = c[0];
-    c[0] = tmp;
-  }
-  for (int i = 2; i < c.size(); ++i) {
-    int utility = literalUtility(c[i]);
-    if (utility > literalUtility(c[0])) {
-      // c[0], c[1],      c[i] <== c[i], c[0],     c[1]
-      Lit tmp = c[1];
-      c[1] = c[0];
-      c[0] = c[i];
-      c[i] = tmp;
-    } else if (utility > literalUtility(c[1])) {
-      // c[i] becomes c[1]
-      Lit tmp = c[1];
-      c[1] = c[i];
-      c[i] = tmp;
-    }
-  }
-}
-
 bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
 {
     if (!ok) return false;

@@ -206,6 +206,42 @@ class Solver : protected EnvObj
     }
   };
 
+  struct lemma_lt_elevate
+  {
+    Solver& d_solver;
+    lemma_lt_elevate(Solver& solver) : d_solver(solver) {}
+    bool operator()(Lit x, Lit y)
+    {
+      lbool x_value = d_solver.value(x);
+      lbool y_value = d_solver.value(y);
+      // Two unassigned literals are sorted arbitrarily
+      if (x_value == l_Undef && y_value == l_Undef)
+      {
+        return x < y;
+      }
+      // Unassigned literals are put to front
+      if (x_value == l_Undef) return true;
+      if (y_value == l_Undef) return false;
+      // Literals of the same value are sorted by decreasing levels
+      if (x_value == y_value)
+      {
+        return d_solver.trail_index(var(x)) > d_solver.trail_index(var(y));
+      }
+      else
+      {
+        // True literals go up front
+        if (x_value == l_True)
+        {
+          return true;
+        }
+        else
+        {
+          return false;
+        }
+      }
+    }
+  };
+
   // cvc5 context push/pop
   void push();
   void pop();

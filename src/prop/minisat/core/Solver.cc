@@ -2106,6 +2106,7 @@ CRef Solver::updateLemmas() {
 
   // We use this comparison operator
   lemma_lt lt(*this);
+  lemma_lt_elevate lte(*this);
 
   // Check for propagation and level to backtrack to
   int i = 0;
@@ -2136,15 +2137,15 @@ CRef Solver::updateLemmas() {
       if (lemma.size() == 1 || value(lemma[1]) == l_False) {
         Trace("minisat::lemmas") << "found unit " << lemma.size() << std::endl;
         if (options().booleans.chronologicalBacktracking) {
-          int currentBacktrackLevel = std::max(level(var(lemma[0])) - 1, 0);
-          if (value(lemma[0]) == l_False  // conflict
-          || (value(lemma[0]) == l_True && level(var(lemma[0])) > currentBacktrackLevel)) {  // missed lower implication
-            // we do not backtrack for implications now.
-            // we only backtrack for missed lower implication and conflicts
+          if (value(lemma[0]) == l_False) {
+            // We do not backtrack for implications now. We only backtrack for conflicts
+            int currentBacktrackLevel = std::max(level(var(lemma[0])) - 1, 0);
             backtrackLevel = std::min(backtrackLevel, currentBacktrackLevel);
           }
         } else {
           // This lemma propagates, see which level we need to backtrack to
+          Assert(lemma.size() == 1 || value(lemma[1]) == l_False);
+          Assert(lemma.size() == 1 || level(var(lemma[1])) >= 0);
           int currentBacktrackLevel = lemma.size() == 1 ? 0 : level(var(lemma[1]));
           // Even if the first literal is true, we should propagate it at this level (unless it's set at a lower level)
           if (value(lemma[0]) != l_True || level(var(lemma[0])) > currentBacktrackLevel) {
@@ -2159,9 +2160,6 @@ CRef Solver::updateLemmas() {
     cancelUntil(backtrackLevel);
   }
 
-  // Last index in the trail
-  int backtrack_index = trail.size();
-
   // Attach all the clauses and enqueue all the propagations
   for (int j = 0; j < lemmas.size(); ++j)
   {
@@ -2172,6 +2170,9 @@ CRef Solver::updateLemmas() {
     // Attach it if non-unit
     CRef lemma_ref = CRef_Undef;
     if (lemma.size() > 1) {
+      // we need the latest literal to be at the front, such that we know if the repropagation will catch the missed lower implications
+      // since we will change the order of the literals, we should compute the level right now.
+      sort(lemma, lte);
       // If the lemmas is removable, we can compute its level by the level
       int clauseLevel = assertionLevel;
       if (removable && !assertionLevelOnly())
@@ -2212,7 +2213,8 @@ CRef Solver::updateLemmas() {
 
     // If the lemma is propagating enqueue its literal (or set the conflict)
     if (conflict == CRef_Undef && value(lemma[0]) != l_True) {
-      if (lemma.size() == 1 || (value(lemma[1]) == l_False && trail_index(var(lemma[1])) < backtrack_index)) {
+      if (lemma.size() == 1 || value(lemma[1]) == l_False) {
+        int impl_level = lemma.size() == 1 ? 0 : computeClauseLevel(lemma_ref);
         Trace("pf::sat") << "Solver::updateLemmas: unit theory lemma: "
                          << lemma[0] << std::endl;
         if (value(lemma[0]) == l_False) {
@@ -2228,11 +2230,25 @@ CRef Solver::updateLemmas() {
               d_pfManager->storeUnitConflict(lemma[0]);
             }
           }
-        } else {
+        } else if (value(lemma[0]) == l_Undef) {
           Trace("minisat::lemmas") << "lemma size is " << lemma.size() << std::endl;
           Trace("minisat::lemmas") << "lemma ref is " << lemma_ref << std::endl;
-          int impl_lvl = lemma_ref == CRef_Undef ? 0 : computeClauseLevel(lemma_ref);
-          uncheckedEnqueue(lemma[0], lemma_ref, impl_lvl);
+          Assert(impl_level >= 0);
+          Assert(impl_level <= decisionLevel());
+          uncheckedEnqueue(lemma[0], lemma_ref, impl_level);
+        } else if (level(var(lemma[0])) > impl_level) {
+          // this is a missed lower implication, wee need to deal with it, or it might become a missed implication later
+          Assert(value(lemma[0]) == l_True);
+          Assert(options().booleans.chronologicalBacktracking);
+          // this is a missed lower implication. One of two things can be.
+          if (trail_index(var(lemma[0])) > trail_index(var(lemma[1]))) {
+            // 1. The missed lower implication follows the topological order of the trail, in which case we can just change the reason and level of the clause
+            Var v = var(lemma[0]);
+            vardata[v].d_level = impl_level;
+            vardata[v].d_reason = lemma_ref;
+          }
+          // 2. The missed lower implication does not follow the topological order of the trail, in which case we need to backtrack to the level of the missed lower implication
+          // this means that the repropagation will catch it later. We do not need to do anything here
         }
       }
     }

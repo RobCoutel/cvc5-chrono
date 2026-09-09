@@ -756,6 +756,7 @@ void Solver::cancelUntil(int level) {
     std::tuple<Lit, CRef, int> t = *it;
     Lit l = std::get<0>(t);
     CRef reason = std::get<1>(t);
+    Assert(reason != CRef_Lazy); // cannot happen as CRef_Lazy implies highest level so far
     int lvl = std::get<2>(t);
     uncheckedEnqueue(l, reason, lvl);
   }

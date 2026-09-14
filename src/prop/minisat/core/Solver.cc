@@ -416,6 +416,28 @@ int Solver::computeClauseLevel(CRef cref) const
   Assert(lvl <= decisionLevel());
   return lvl;
 }
+
+bool Solver::assertingClause(CRef cref, int& out_max_level, int& out_max_index) const
+{
+  out_max_level = -1;
+  Assert(cref != CRef_Undef);
+  Assert(cref != CRef_Lazy);
+  const Clause& c = ca[cref];
+  int count = 0;
+  for (int i = 0; i < c.size(); ++i) {
+    Assert (value(c[i]) == l_False);
+    int l = level(var(c[i]));
+    if (l > out_max_level) {
+      out_max_level = l;
+      out_max_index = i;
+      count = 1;
+    } else if (l == out_max_level) {
+      count++;
+    }
+  }
+  return count == 1;
+}
+
 int Solver::literalUtility(Lit lit)
 {
   if (value(lit) == l_True) {
@@ -1609,11 +1631,44 @@ lbool Solver::search(int nof_conflicts)
         return l_False;
       }
 
-      // Analyze the conflict
-      learnt_clause.clear();
       if (options().booleans.chronologicalBacktracking) {
         cancelUntil(conflict_level);
+        int max_level = -1;
+        int max_index = -1;
+        if (assertingClause(confl, max_level, max_index)) {
+          // we do not want to trigger the analysis.
+          // But we need to fix the watched literals
+          Clause& c = ca[confl];
+          if (max_index == 1) {
+            // we just need to swap the first two literals
+            Lit tmp = c[0];
+            c[0] = c[1];
+            c[1] = tmp;
+          } else if (max_index > 1) {
+            // we need to stop watching the first literal and start watching the max_index literal
+            vec<Watcher>&  ws  = watches[~c[0]];
+            for (int i = 0; i < ws.size(); ++i) {
+              if (ws[i].cref == confl) {
+                ws[i] = ws.last();
+                ws.pop();
+                break;
+              }
+              Assert(i < ws.size());
+            }
+            Lit tmp = c[0];
+            c[0] = c[max_index];
+            c[max_index] = tmp;
+            watches[~c[0]].push(Watcher(confl, c[1]));
+          }
+
+          cancelUntil(max_level - 1);
+          Assert(value(ca[confl][0]) == l_Undef);
+          uncheckedEnqueue(ca[confl][0], confl, computeClauseLevel(confl));
+          continue;
+        }
       }
+      // Analyze the conflict
+      learnt_clause.clear();
       int max_level = analyze(confl, learnt_clause, backtrack_level);
       if (backtrack_level < 0) {
         goto unsat_result;

@@ -584,6 +584,10 @@ class Solver : protected EnvObj
   CRef reason(Var x);  // Get the reason of the variable (non const as it might
                        // create the explanation on the fly)
   int computeClauseLevel(CRef cref) const; // Compute the level of a clause (the maximum level of its literals)
+  bool assertingClause(CRef cref, int& max_level, int& max_index) const;
+                                         // Check if a clause is asserting after backtracking.
+                                         // That is, the clause is conflicting with exactly one literal at the highest level.
+                                         // max_level is the highest level of the clause, and max_index is the index of the literal at that level.
   bool hasReasonClause(Var x) const;  // Does the variable have a reason
   bool isPropagated(
       Var x) const;  // Does the variable have a propagated variables

@@ -416,6 +416,28 @@ int Solver::computeClauseLevel(CRef cref) const
   Assert(lvl <= decisionLevel());
   return lvl;
 }
+
+bool Solver::assertingClause(CRef cref, int& out_max_level, int& out_max_index) const
+{
+  out_max_level = -1;
+  Assert(cref != CRef_Undef);
+  Assert(cref != CRef_Lazy);
+  const Clause& c = ca[cref];
+  int count = 0;
+  for (int i = 0; i < c.size(); ++i) {
+    Assert (value(c[i]) == l_False);
+    int l = level(var(c[i]));
+    if (l > out_max_level) {
+      out_max_level = l;
+      out_max_index = i;
+      count = 1;
+    } else if (l == out_max_level) {
+      count++;
+    }
+  }
+  return count == 1;
+}
+
 int Solver::literalUtility(Lit lit)
 {
   if (value(lit) == l_True) {
@@ -1609,11 +1631,44 @@ lbool Solver::search(int nof_conflicts)
         return l_False;
       }
 
-      // Analyze the conflict
-      learnt_clause.clear();
       if (options().booleans.chronologicalBacktracking) {
         cancelUntil(conflict_level);
+        int max_level = -1;
+        int max_index = -1;
+        if (assertingClause(confl, max_level, max_index)) {
+          // we do not want to trigger the analysis.
+          // But we need to fix the watched literals
+          Clause& c = ca[confl];
+          if (max_index == 1) {
+            // we just need to swap the first two literals
+            Lit tmp = c[0];
+            c[0] = c[1];
+            c[1] = tmp;
+          } else if (max_index > 1) {
+            // we need to stop watching the first literal and start watching the max_index literal
+            vec<Watcher>&  ws  = watches[~c[0]];
+            for (int i = 0; i < ws.size(); ++i) {
+              if (ws[i].cref == confl) {
+                ws[i] = ws.last();
+                ws.pop();
+                break;
+              }
+              Assert(i < ws.size());
+            }
+            Lit tmp = c[0];
+            c[0] = c[max_index];
+            c[max_index] = tmp;
+            watches[~c[0]].push(Watcher(confl, c[1]));
+          }
+
+          cancelUntil(max_level - 1);
+          Assert(value(ca[confl][0]) == l_Undef);
+          uncheckedEnqueue(ca[confl][0], confl, computeClauseLevel(confl));
+          continue;
+        }
       }
+      // Analyze the conflict
+      learnt_clause.clear();
       int max_level = analyze(confl, learnt_clause, backtrack_level);
       if (backtrack_level < 0) {
         goto unsat_result;
@@ -2212,44 +2267,42 @@ CRef Solver::updateLemmas() {
     }
 
     // If the lemma is propagating enqueue its literal (or set the conflict)
-    if (conflict == CRef_Undef && value(lemma[0]) != l_True) {
-      if (lemma.size() == 1 || value(lemma[1]) == l_False) {
-        int impl_level = lemma.size() == 1 ? 0 : computeClauseLevel(lemma_ref);
-        Trace("pf::sat") << "Solver::updateLemmas: unit theory lemma: "
-                         << lemma[0] << std::endl;
-        if (value(lemma[0]) == l_False) {
-          // We have a conflict
-          if (lemma.size() > 1) {
-            Trace("minisat::lemmas") << "Solver::updateLemmas(): conflict" << std::endl;
-            conflict = lemma_ref;
-          } else {
-            Trace("minisat::lemmas") << "Solver::updateLemmas(): unit conflict or empty clause" << std::endl;
-            conflict = CRef_Lazy;
-            if (needProof())
-            {
-              d_pfManager->storeUnitConflict(lemma[0]);
-            }
+    if (conflict == CRef_Undef && (lemma.size() == 1 || value(lemma[1]) == l_False)) {
+      int impl_level = lemma.size() == 1 ? 0 : computeClauseLevel(lemma_ref);
+      Trace("pf::sat") << "Solver::updateLemmas: unit theory lemma: "
+                        << lemma[0] << std::endl;
+      if (value(lemma[0]) == l_False) {
+        // We have a conflict
+        if (lemma.size() > 1) {
+          Trace("minisat::lemmas") << "Solver::updateLemmas(): conflict" << std::endl;
+          conflict = lemma_ref;
+        } else {
+          Trace("minisat::lemmas") << "Solver::updateLemmas(): unit conflict or empty clause" << std::endl;
+          conflict = CRef_Lazy;
+          if (needProof())
+          {
+            d_pfManager->storeUnitConflict(lemma[0]);
           }
-        } else if (value(lemma[0]) == l_Undef) {
-          Trace("minisat::lemmas") << "lemma size is " << lemma.size() << std::endl;
-          Trace("minisat::lemmas") << "lemma ref is " << lemma_ref << std::endl;
-          Assert(impl_level >= 0);
-          Assert(impl_level <= decisionLevel());
-          uncheckedEnqueue(lemma[0], lemma_ref, impl_level);
-        } else if (level(var(lemma[0])) > impl_level) {
-          // this is a missed lower implication, wee need to deal with it, or it might become a missed implication later
-          Assert(value(lemma[0]) == l_True);
-          Assert(options().booleans.chronologicalBacktracking);
-          // this is a missed lower implication. One of two things can be.
-          if (trail_index(var(lemma[0])) > trail_index(var(lemma[1]))) {
-            // 1. The missed lower implication follows the topological order of the trail, in which case we can just change the reason and level of the clause
-            Var v = var(lemma[0]);
-            vardata[v].d_level = impl_level;
-            vardata[v].d_reason = lemma_ref;
-          }
-          // 2. The missed lower implication does not follow the topological order of the trail, in which case we need to backtrack to the level of the missed lower implication
-          // this means that the repropagation will catch it later. We do not need to do anything here
         }
+      } else if (value(lemma[0]) == l_Undef) {
+        Trace("minisat::lemmas") << "lemma size is " << lemma.size() << std::endl;
+        Trace("minisat::lemmas") << "lemma ref is " << lemma_ref << std::endl;
+        Assert(impl_level >= 0);
+        Assert(impl_level <= decisionLevel());
+        uncheckedEnqueue(lemma[0], lemma_ref, impl_level);
+      } else if (level(var(lemma[0])) > impl_level) {
+        // this is a missed lower implication, wee need to deal with it, or it might become a missed implication later
+        Assert(value(lemma[0]) == l_True);
+        Assert(options().booleans.chronologicalBacktracking);
+        // this is a missed lower implication. One of two things can be.
+        if (lemma.size() == 1 ||trail_index(var(lemma[0])) > trail_index(var(lemma[1]))) {
+          // 1. The missed lower implication follows the topological order of the trail, in which case we can just change the reason and level of the clause
+          Var v = var(lemma[0]);
+          vardata[v].d_level = impl_level;
+          vardata[v].d_reason = lemma_ref;
+        }
+        // 2. The missed lower implication does not follow the topological order of the trail, in which case we need to backtrack to the level of the missed lower implication
+        // this means that the repropagation will catch it later. We do not need to do anything here
       }
     }
   }

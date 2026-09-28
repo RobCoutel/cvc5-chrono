@@ -1,4 +1,4 @@
-; COMMAND-LINE:
+; COMMAND-LINE: --no-chronological-backtracking
 ; EXPECT: unknown
 (set-logic ALL)
 (declare-const x1 Bool)

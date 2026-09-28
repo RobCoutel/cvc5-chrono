@@ -445,6 +445,8 @@ class Solver : protected EnvObj
       flipped;  // Which trail_lim decisions have been flipped in this context.
   vec<Lit> trail;  // Assignment stack; stores all assigments made in the order
                    // they were made.
+  // Queue of literals to propagate next after backtracking in CB.
+  std::vector<std::tuple<Lit, CRef, int>> re_prop_queue;
   vec<int>
       trail_lim;  // Separator indices for different decision levels in 'trail'.
   vec<bool> trail_ok;    // Stack of "whether we're in conflict" flags.
@@ -583,7 +585,24 @@ class Solver : protected EnvObj
       const;  // Used to represent an abstraction of sets of decision levels.
   CRef reason(Var x);  // Get the reason of the variable (non const as it might
                        // create the explanation on the fly)
-  int computeClauseLevel(CRef cref) const; // Compute the level of a clause (the maximum level of its literals)
+  // Compute the level of a clause (the maximum level of its literals)
+  int computeClauseLevel(CRef cref) const {
+    Assert(cref != CRef_Undef);
+    if (cref == CRef_Lazy)
+      return decisionLevel();
+
+    const Clause& c = ca[cref];
+    Assert(c.size() > 0);
+    int lvl = 0;
+    int i = value(c[0]) != l_False ? 1 : 0;
+    for (; i < c.size(); ++i) {
+      Assert(value(c[i]) == l_False);
+      lvl = std::max(lvl, level(var(c[i])));
+    }
+    Assert(lvl <= decisionLevel());
+    return lvl;
+  }
+
   bool assertingClause(CRef cref, int& max_level, int& max_index) const;
                                          // Check if a clause is asserting after backtracking.
                                          // That is, the clause is conflicting with exactly one literal at the highest level.

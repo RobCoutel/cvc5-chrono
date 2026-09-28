@@ -1,3 +1,4 @@
+; COMMAND-LINE: --no-chronological-backtracking
 ; DISABLE-TESTER: lfsc
 (set-logic QF_UFIDL)
 (set-info :source |

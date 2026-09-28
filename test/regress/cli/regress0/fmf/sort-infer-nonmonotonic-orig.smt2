@@ -1,5 +1,5 @@
 ; REQUIRES: unrestricted-mode
-; COMMAND-LINE: --finite-model-find --sort-inference
+; COMMAND-LINE: --finite-model-find --sort-inference --no-chronological-backtracking
 ; EXPECT: unsat
 ; DISABLE-TESTER: lfsc
 (set-logic UFC)

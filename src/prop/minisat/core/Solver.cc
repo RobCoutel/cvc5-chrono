@@ -399,24 +399,6 @@ CRef Solver::reason(Var x) {
   return real_reason;
 }
 
-int Solver::computeClauseLevel(CRef cref) const
-{
-  Assert(cref != CRef_Undef);
-  if (cref == CRef_Lazy)
-    return decisionLevel();
-
-  const Clause& c = ca[cref];
-  Assert(c.size() > 0);
-  int lvl = 0;
-  int i = value(c[0]) != l_False ? 1 : 0;
-  for (; i < c.size(); ++i) {
-    Assert(value(c[i]) == l_False);
-    lvl = std::max(lvl, level(var(c[i])));
-  }
-  Assert(lvl <= decisionLevel());
-  return lvl;
-}
-
 bool Solver::assertingClause(CRef cref, int& out_max_level, int& out_max_index) const
 {
   out_max_level = -1;
@@ -585,7 +567,8 @@ bool Solver::addClause_(vec<Lit>& ps, bool removable, ClauseId& id)
       if (ps.size() == falseLiteralsCount + 1 && assigns[var(ps[0])] == l_Undef)
       {
         Assert(assigns[var(ps[0])] != l_False);
-        uncheckedEnqueue(ps[0], cr, cr == CRef_Undef ? 0 : computeClauseLevel(cr));
+        Assert(cr == CRef_Undef || ca[cr].size() > 1);
+        uncheckedEnqueue(ps[0], cr, cr == CRef_Undef ? 0 : level(var(ps[1])));
         Trace("pf::sat") << "Registering a unit clause " << ps[0]
                          << ", maybe input, with assigned var value "
                          << (assigns[var(ps[0])] == l_True
@@ -745,7 +728,7 @@ void Solver::cancelUntil(int level) {
     d_context->pop();
   }
 
-  std::vector<std::tuple<Lit, CRef, int>> toRequeue;
+  Assert(re_prop_queue.empty());
 
   // keep the assignments that are lower than the backtrack level
   int trailSize = trail.size();
@@ -754,12 +737,11 @@ void Solver::cancelUntil(int level) {
     Var x  = var(l);
     if (vardata[x].d_level <= level) {
       Assert(options().booleans.chronologicalBacktracking);
-      toRequeue.push_back(std::make_tuple(l, vardata[x].d_reason, vardata[x].d_level));
+      re_prop_queue.push_back(std::make_tuple(l, vardata[x].d_reason, vardata[x].d_level));
     }
 
     assigns [x] = l_Undef;
     vardata[x].d_trail_index = -1;
-    vardata[x].d_level = -1;
     if ((phase_saving > 1
      || ((phase_saving == 1) && trailSize > trail_lim.last()))
     && ((polarity[x] & 0x2) == 0)) {
@@ -771,17 +753,18 @@ void Solver::cancelUntil(int level) {
   trail.shrink(trail.size() - trail_lim[level]);
   trail_lim.shrink(trail_lim.size() - level);
   flipped.shrink(flipped.size() - level);
-  d_proxy->notifyBacktrack();
 
   // we now need to notify the proxy of all the assignment that are still on the trail, as they are now backtracked to and may be relevant for theory propagation
-  for (auto it = toRequeue.rbegin(); it != toRequeue.rend(); ++it) {
-    std::tuple<Lit, CRef, int> t = *it;
+  while (!re_prop_queue.empty()) {
+    std::tuple<Lit, CRef, int> t = re_prop_queue.back();
+    re_prop_queue.pop_back();
     Lit l = std::get<0>(t);
     CRef reason = std::get<1>(t);
     Assert(reason != CRef_Lazy); // cannot happen as CRef_Lazy implies highest level so far
     int lvl = std::get<2>(t);
     uncheckedEnqueue(l, reason, lvl);
   }
+  d_proxy->notifyBacktrack();
 }
 
 void Solver::resetTrail() { cancelUntil(0); }
@@ -1613,7 +1596,7 @@ lbool Solver::search(int nof_conflicts)
     int conflict_level = options().booleans.chronologicalBacktracking ?
                            computeClauseLevel(confl) :
                            decisionLevel();
-    if (conflict_level == 0)
+    if (confl == CRef_Lazy || conflict_level == 0)
       {
         unsat_result:
         cancelUntil(0);
@@ -1631,11 +1614,14 @@ lbool Solver::search(int nof_conflicts)
         return l_False;
       }
 
+      bool skip_analysis = false;
+
       if (options().booleans.chronologicalBacktracking) {
         cancelUntil(conflict_level);
         int max_level = -1;
         int max_index = -1;
         if (assertingClause(confl, max_level, max_index)) {
+          skip_analysis = true;
           // we do not want to trigger the analysis.
           // But we need to fix the watched literals
           Clause& c = ca[confl];
@@ -1664,60 +1650,61 @@ lbool Solver::search(int nof_conflicts)
           cancelUntil(max_level - 1);
           Assert(value(ca[confl][0]) == l_Undef);
           uncheckedEnqueue(ca[confl][0], confl, computeClauseLevel(confl));
-          continue;
         }
       }
-      // Analyze the conflict
-      learnt_clause.clear();
-      int max_level = analyze(confl, learnt_clause, backtrack_level);
-      if (backtrack_level < 0) {
-        goto unsat_result;
-      }
-      cancelUntil(backtrack_level);
+      if (!skip_analysis) {
+        // Analyze the conflict
+        learnt_clause.clear();
+        int max_level = analyze(confl, learnt_clause, backtrack_level);
+        if (backtrack_level < 0) {
+          goto unsat_result;
+        }
+        cancelUntil(backtrack_level);
 
-      Assert(learnt_clause.size() > 0);
-      Assert(value(learnt_clause[0]) == l_Undef);
-      Assert(learnt_clause.size() == 1 || value(learnt_clause[1]) == l_False);
-      // Assert the conflict clause and the asserting literal
-      if (learnt_clause.size() == 1)
-      {
-        uncheckedEnqueue(learnt_clause[0]);
-        if (needProof())
+        Assert(learnt_clause.size() > 0);
+        Assert(value(learnt_clause[0]) == l_Undef);
+        Assert(learnt_clause.size() == 1 || value(learnt_clause[1]) == l_False);
+        // Assert the conflict clause and the asserting literal
+        if (learnt_clause.size() == 1)
         {
-          d_pfManager->endResChain(learnt_clause[0]);
-        }
-        // Call notifySatClause here.
-        SatClause satClause;
-        satClause.push_back(MinisatSatSolver::toSatLiteral(learnt_clause[0]));
-        d_proxy->notifySatClause(satClause);
-      }
-      else
-      {
-        CRef cr = ca.alloc(assertionLevelOnly() ? assertionLevel : max_level,
-                           learnt_clause,
-                           true);
-        // Call notifySatClause here.
-        SatClause satClause;
-        MinisatSatSolver::toSatClause(ca[cr], satClause);
-        d_proxy->notifySatClause(satClause);
-        clauses_removable.push(cr);
-        attachClause(cr);
-        claBumpActivity(ca[cr]);
-        uncheckedEnqueue(learnt_clause[0], cr, computeClauseLevel(cr));
-        if (needProof())
-        {
-          d_pfManager->endResChain(ca[cr]);
-          if (TraceIsOn("pf::sat") && ca[cr].level() < assertionLevel)
+          uncheckedEnqueue(learnt_clause[0]);
+          if (needProof())
           {
-            Trace("pf::sat")
-                << "learnt_clause: " << ca[cr] << " clause/assert levels "
-                << ca[cr].level() << " / " << assertionLevel << "\n";
+            d_pfManager->endResChain(learnt_clause[0]);
+          }
+          // Call notifySatClause here.
+          SatClause satClause;
+          satClause.push_back(MinisatSatSolver::toSatLiteral(learnt_clause[0]));
+          d_proxy->notifySatClause(satClause);
+        }
+        else
+        {
+          CRef cr = ca.alloc(assertionLevelOnly() ? assertionLevel : max_level,
+                            learnt_clause,
+                            true);
+          // Call notifySatClause here.
+          SatClause satClause;
+          MinisatSatSolver::toSatClause(ca[cr], satClause);
+          d_proxy->notifySatClause(satClause);
+          clauses_removable.push(cr);
+          attachClause(cr);
+          claBumpActivity(ca[cr]);
+          uncheckedEnqueue(learnt_clause[0], cr, computeClauseLevel(cr));
+          if (needProof())
+          {
+            d_pfManager->endResChain(ca[cr]);
+            if (TraceIsOn("pf::sat") && ca[cr].level() < assertionLevel)
+            {
+              Trace("pf::sat")
+                  << "learnt_clause: " << ca[cr] << " clause/assert levels "
+                  << ca[cr].level() << " / " << assertionLevel << "\n";
+            }
           }
         }
+        varDecayActivity();
+        claDecayActivity();
       }
 
-      varDecayActivity();
-      claDecayActivity();
 
       if (--learntsize_adjust_cnt == 0)
       {
@@ -2267,12 +2254,35 @@ CRef Solver::updateLemmas() {
     }
 
     // If the lemma is propagating enqueue its literal (or set the conflict)
-    if (conflict == CRef_Undef && (lemma.size() == 1 || value(lemma[1]) == l_False)) {
+    if (conflict != CRef_Lazy && (lemma.size() == 1 || value(lemma[1]) == l_False)) {
       int impl_level = lemma.size() == 1 ? 0 : computeClauseLevel(lemma_ref);
       Trace("pf::sat") << "Solver::updateLemmas: unit theory lemma: "
                         << lemma[0] << std::endl;
       if (value(lemma[0]) == l_False) {
         // We have a conflict
+        if (lemma.size() == 1 && level(var(lemma[0])) > 0) {
+          // It could be that two lemmas are conflicting. One asserts a literal and the other asserts its negation.
+          // If this is the case, it does not mean that we have a conflict at level 0, but rather that we need to backtrack and try again.
+          // The problem only occurs when the clause is unit. Indeed, if the clause is not unit, it will be registered and conflict analysis can be used.
+          // If the clause is not registered, we cannot apply conflict analysis on it.
+          cancelUntil(level(var(lemma[0])) - 1);
+          // check that the previous conflict is still conflicting
+          if (conflict != CRef_Undef && conflict != CRef_Lazy) {
+            Clause& c = ca[conflict];
+            int k = 0;
+            for (; k < c.size(); ++k) {
+              if (value(c[k]) != l_False) {
+                break;
+              }
+            }
+            if (k != c.size()) {
+              // the previous conflict is no longer conflicting, we can remove it
+              conflict = CRef_Undef;
+            }
+          }
+          j--;
+          continue;
+        }
         if (lemma.size() > 1) {
           Trace("minisat::lemmas") << "Solver::updateLemmas(): conflict" << std::endl;
           conflict = lemma_ref;
@@ -2295,7 +2305,7 @@ CRef Solver::updateLemmas() {
         Assert(value(lemma[0]) == l_True);
         Assert(options().booleans.chronologicalBacktracking);
         // this is a missed lower implication. One of two things can be.
-        if (lemma.size() == 1 ||trail_index(var(lemma[0])) > trail_index(var(lemma[1]))) {
+        if (lemma.size() == 1 || trail_index(var(lemma[0])) > trail_index(var(lemma[1]))) {
           // 1. The missed lower implication follows the topological order of the trail, in which case we can just change the reason and level of the clause
           Var v = var(lemma[0]);
           vardata[v].d_level = impl_level;
